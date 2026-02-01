@@ -243,13 +243,11 @@ async def fetch_markets_page(hc: httpx.AsyncClient, offset: int) -> List[Dict[st
     """
     url = f"{GAMMA}/markets"
     params = {
-        "active": "true",
-        "closed": "false",
-        "limit": MARKETS_PAGE_LIMIT,
-        "offset": offset,
-        "order": "startTime",
-        "ascending": "true",
-    }
+    "active": "true",
+    "closed": "false",
+    "limit": MARKETS_PAGE_LIMIT,
+    "offset": offset,
+}
     data = await http_get_json(hc, url, params=params)
     if isinstance(data, list):
         return data
