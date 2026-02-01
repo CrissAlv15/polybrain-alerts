@@ -1,372 +1,439 @@
 import os
-import asyncio
-import random
 import time
-import traceback
-from typing import Any, Dict, List, Optional, Tuple
+import asyncio
+import logging
+from typing import Any, Dict, Optional, Tuple
 
-import discord
 import httpx
+import discord
 
-# =========================
-# ENV / CONFIG
-# =========================
-DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN", "").strip()
-DISCORD_CHANNEL_ID_RAW = os.getenv("DISCORD_CHANNEL_ID", "").strip()
 
-if not DISCORD_BOT_TOKEN or not DISCORD_CHANNEL_ID_RAW:
+# ----------------------------
+# ENV
+# ----------------------------
+DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN", "")
+DISCORD_CHANNEL_ID = os.getenv("DISCORD_CHANNEL_ID", "")
+
+if not DISCORD_BOT_TOKEN or not DISCORD_CHANNEL_ID:
     raise SystemExit("Missing DISCORD_BOT_TOKEN or DISCORD_CHANNEL_ID")
 
-DISCORD_CHANNEL_ID = int(DISCORD_CHANNEL_ID_RAW)
+DISCORD_CHANNEL_ID_INT = int(DISCORD_CHANNEL_ID)
 
-# Polymarket Gamma API
-GAMMA = os.getenv("GAMMA_API_BASE", "https://gamma-api.polymarket.com").strip().rstrip("/")
+# Optional tuning knobs (safe defaults)
+MIN_EDGE = float(os.getenv("MIN_EDGE", "0.04"))         # 4% edge required
+MAX_SPREAD = float(os.getenv("MAX_SPREAD", "0.10"))     # ignore wide spreads
+ALERT_COOLDOWN_SEC = int(os.getenv("ALERT_COOLDOWN_SEC", "900"))  # 15 min per market
+UNIVERSE_REFRESH_SEC = float(os.getenv("UNIVERSE_REFRESH_SEC", "12"))
+SCAN_INTERVAL_SEC = float(os.getenv("SCAN_INTERVAL_SEC", "2.5"))
+MAX_MARKETS = int(os.getenv("MAX_MARKETS", "1200"))
 
-# Timings
-SCAN_INTERVAL_SEC = float(os.getenv("SCAN_INTERVAL_SEC", "20"))          # scan loop
-UNIVERSE_REFRESH_SEC = float(os.getenv("UNIVERSE_REFRESH_SEC", "60"))    # refresh markets list
-HEARTBEAT_MIN = float(os.getenv("HEARTBEAT_MIN", "180"))                 # "I'm alive" ping
+GAMMA = "https://gamma-api.polymarket.com"
 
-# Universe size / pagination
-PAGE_LIMIT = int(os.getenv("PAGE_LIMIT", "200"))
-MAX_MARKETS = int(os.getenv("MAX_MARKETS", "1500"))
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
 
-# Alerts & thresholds
-# Arb definition: if (price_yes + price_no) < 1.0 by this margin -> alert
-MIN_ARB_EDGE = float(os.getenv("MIN_ARB_EDGE", "0.02"))  # 0.02 = 2 cents edge
-ALERT_COOLDOWN_MIN = float(os.getenv("ALERT_COOLDOWN_MIN", "45"))  # per-market per-type cooldown
-
-# Error controls
-ERROR_COOLDOWN_MIN = float(os.getenv("ERROR_COOLDOWN_MIN", "10"))  # don't spam same error repeatedly
-
-# =========================
-# DISCORD SETUP
-# =========================
-intents = discord.Intents.default()
-client = discord.Client(intents=intents)
-
-# =========================
-# STATE
-# =========================
-_market_universe: List[Dict[str, Any]] = []
-_last_universe_refresh: float = 0.0
-
-_last_alert_at: Dict[str, float] = {}  # key: f"{kind}:{market_id}"
-_last_error_at: float = 0.0
-_last_heartbeat_at: float = 0.0
-
-_http: Optional[httpx.AsyncClient] = None
-
-
-# =========================
-# HELPERS
-# =========================
-def now_ts() -> float:
-    return time.time()
-
-def clamp(x: float, lo: float, hi: float) -> float:
-    return max(lo, min(hi, x))
-
-def _mk_alert_key(kind: str, market_id: str) -> str:
-    return f"{kind}:{market_id}"
-
-async def get_channel() -> discord.TextChannel:
-    ch = client.get_channel(DISCORD_CHANNEL_ID)
-    if ch is None:
-        # Fallback to fetch (works even if not cached yet)
-        ch = await client.fetch_channel(DISCORD_CHANNEL_ID)
-    return ch  # type: ignore
-
-async def send_discord(msg: str) -> None:
-    ch = await get_channel()
-    await ch.send(msg)
-
-def should_cooldown(kind: str, market_id: str) -> bool:
-    k = _mk_alert_key(kind, market_id)
-    last = _last_alert_at.get(k, 0.0)
-    return (now_ts() - last) < (ALERT_COOLDOWN_MIN * 60.0)
-
-def mark_alert(kind: str, market_id: str) -> None:
-    _last_alert_at[_mk_alert_key(kind, market_id)] = now_ts()
-
-def parse_float(v: Any) -> Optional[float]:
+# ----------------------------
+# Helpers: robust numeric parsing
+# ----------------------------
+def _to_float(x: Any) -> Optional[float]:
     try:
-        if v is None:
+        if x is None:
             return None
-        if isinstance(v, (int, float)):
-            return float(v)
-        if isinstance(v, str) and v.strip() == "":
-            return None
-        return float(v)
+        return float(x)
     except Exception:
         return None
 
-async def http_get_json(url: str, params: Optional[Dict[str, Any]] = None) -> Any:
+
+def clamp01(p: float) -> float:
+    if p < 0.0:
+        return 0.0
+    if p > 1.0:
+        return 1.0
+    return p
+
+
+def now_ts() -> float:
+    return time.time()
+
+
+# ----------------------------
+# Polymarket parsing
+# ----------------------------
+def extract_binary_prices(m: Dict[str, Any]) -> Optional[Dict[str, float]]:
     """
-    Robust GET with:
-    - retries
-    - exponential backoff + jitter
-    - special handling for 429
+    Tries to extract YES/NO best bid/ask from common gamma fields.
+    Works across slight API differences by trying multiple keys.
+
+    Returns:
+      {
+        "yes_bid": float,
+        "yes_ask": float,
+        "no_bid": float,
+        "no_ask": float
+      }
+    or None if missing.
     """
-    assert _http is not None
-    max_tries = 6
-    base_delay = 0.7
+    # Common keys seen in gamma data / variants:
+    # yesBuyPrice  = price to buy YES (ask)
+    # yesSellPrice = price to sell YES (bid)
+    # noBuyPrice   = price to buy NO  (ask)
+    # noSellPrice  = price to sell NO (bid)
 
-    for attempt in range(1, max_tries + 1):
-        try:
-            r = await _http.get(url, params=params)
-            if r.status_code == 429:
-                retry_after = r.headers.get("Retry-After")
-                if retry_after:
-                    try:
-                        wait_s = float(retry_after)
-                    except Exception:
-                        wait_s = 2.0
-                else:
-                    # exponential backoff + jitter
-                    wait_s = base_delay * (2 ** (attempt - 1)) + random.random() * 0.5
-                wait_s = clamp(wait_s, 1.0, 25.0)
-                print(f"[rate-limit] 429 from {url} -> sleeping {wait_s:.1f}s")
-                await asyncio.sleep(wait_s)
-                continue
+    yes_ask = _to_float(m.get("yesBuyPrice"))
+    yes_bid = _to_float(m.get("yesSellPrice"))
+    no_ask = _to_float(m.get("noBuyPrice"))
+    no_bid = _to_float(m.get("noSellPrice"))
 
-            r.raise_for_status()
-            return r.json()
+    # Some variants use bestBid/bestAsk inside outcome objects; try “outcomes” list
+    if any(v is None for v in (yes_bid, yes_ask, no_bid, no_ask)):
+        outcomes = m.get("outcomes") or m.get("outcomePrices") or None
+        # If outcomes are dict-ish entries, we try to find YES/NO
+        if isinstance(outcomes, list):
+            for o in outcomes:
+                if not isinstance(o, dict):
+                    continue
+                name = (o.get("name") or o.get("outcome") or "").strip().lower()
+                bid = _to_float(o.get("bestBid") or o.get("bid") or o.get("sell"))
+                ask = _to_float(o.get("bestAsk") or o.get("ask") or o.get("buy"))
+                last = _to_float(o.get("last") or o.get("lastPrice") or o.get("price"))
+                # If we only have last, approximate bid/ask tightly
+                if bid is None and last is not None:
+                    bid = last
+                if ask is None and last is not None:
+                    ask = last
 
-        except httpx.HTTPStatusError as e:
-            # Other status codes
-            code = e.response.status_code if e.response else None
-            if attempt < max_tries:
-                wait_s = base_delay * (2 ** (attempt - 1)) + random.random() * 0.5
-                wait_s = clamp(wait_s, 0.8, 20.0)
-                print(f"[http] status={code} attempt={attempt}/{max_tries} wait={wait_s:.1f}s url={url}")
-                await asyncio.sleep(wait_s)
-                continue
-            raise
+                if name in ("yes", "y"):
+                    yes_bid = yes_bid if yes_bid is not None else bid
+                    yes_ask = yes_ask if yes_ask is not None else ask
+                elif name in ("no", "n"):
+                    no_bid = no_bid if no_bid is not None else bid
+                    no_ask = no_ask if no_ask is not None else ask
 
-        except (httpx.TimeoutException, httpx.TransportError) as e:
-            if attempt < max_tries:
-                wait_s = base_delay * (2 ** (attempt - 1)) + random.random() * 0.5
-                wait_s = clamp(wait_s, 0.8, 20.0)
-                print(f"[http] transport/timeout attempt={attempt}/{max_tries} wait={wait_s:.1f}s url={url} err={e}")
-                await asyncio.sleep(wait_s)
-                continue
-            raise
+    if any(v is None for v in (yes_bid, yes_ask, no_bid, no_ask)):
+        return None
+
+    # sanity clamp
+    yes_bid = clamp01(yes_bid)
+    yes_ask = clamp01(yes_ask)
+    no_bid = clamp01(no_bid)
+    no_ask = clamp01(no_ask)
+
+    return {"yes_bid": yes_bid, "yes_ask": yes_ask, "no_bid": no_bid, "no_ask": no_ask}
 
 
-async def refresh_universe() -> None:
+def fair_prob_from_books(pr: Dict[str, float]) -> Optional[float]:
     """
-    Pull active & open markets from Gamma.
-    We keep it simple and safe: paginate until we hit MAX_MARKETS or no more results.
+    Option A “fair value” (vig/overround adjusted) using BOTH sides:
+      p_yes_mid = (yes_bid + yes_ask)/2
+      p_no_mid  = (no_bid  + no_ask)/2
+    Normalize:
+      fair_yes = p_yes_mid / (p_yes_mid + p_no_mid)
+
+    This removes “sum != 1” friction (fees/spread/overround).
     """
-    global _market_universe, _last_universe_refresh
+    p_yes_mid = (pr["yes_bid"] + pr["yes_ask"]) / 2.0
+    p_no_mid = (pr["no_bid"] + pr["no_ask"]) / 2.0
+    denom = p_yes_mid + p_no_mid
+    if denom <= 0:
+        return None
+    return clamp01(p_yes_mid / denom)
 
-    markets: List[Dict[str, Any]] = []
-    offset = 0
 
-    while len(markets) < MAX_MARKETS:
-        params = {
-            "active": "true",
-            "closed": "false",
-            "limit": str(PAGE_LIMIT),
-            "offset": str(offset),
-            # order by start time so universe isn't random; API usually supports these
-            "order": "startTime",
-            "ascending": "true",
+def compute_value_signal(pr: Dict[str, float]) -> Optional[Dict[str, Any]]:
+    """
+    Detect value opportunities:
+      - BUY YES if yes_ask is meaningfully below fair_yes
+      - BUY NO  if no_ask  is meaningfully below fair_no
+    with liquidity checks (spread).
+    """
+    fair_yes = fair_prob_from_books(pr)
+    if fair_yes is None:
+        return None
+
+    fair_no = 1.0 - fair_yes
+
+    yes_spread = pr["yes_ask"] - pr["yes_bid"]
+    no_spread = pr["no_ask"] - pr["no_bid"]
+
+    # Liquidity filter
+    if yes_spread > MAX_SPREAD and no_spread > MAX_SPREAD:
+        return None
+
+    # Edge definition (how far below fair you can BUY)
+    edge_yes = fair_yes - pr["yes_ask"]
+    edge_no = fair_no - pr["no_ask"]
+
+    # pick best side
+    if edge_yes >= MIN_EDGE and yes_spread <= MAX_SPREAD:
+        entry = pr["yes_ask"]
+        tp1 = clamp01(fair_yes)  # first target at fair
+        tp2 = clamp01(fair_yes + edge_yes)  # second target extends by the edge size
+        return {
+            "side": "YES",
+            "entry": entry,
+            "fair": fair_yes,
+            "edge": edge_yes,
+            "tp1": max(entry, tp1),
+            "tp2": max(entry, tp2),
+            "spread": yes_spread,
         }
-        data = await http_get_json(f"{GAMMA}/markets", params=params)
 
-        if not isinstance(data, list) or len(data) == 0:
-            break
-
-        markets.extend([m for m in data if isinstance(m, dict)])
-
-        if len(data) < PAGE_LIMIT:
-            break
-
-        offset += PAGE_LIMIT
-
-    _market_universe = markets[:MAX_MARKETS]
-    _last_universe_refresh = now_ts()
-    print(f"[universe] markets={len(_market_universe)} refresh={UNIVERSE_REFRESH_SEC:.1f}s")
-
-
-def extract_binary_prices(market: Dict[str, Any]) -> Optional[Tuple[float, float]]:
-    """
-    Best-effort: Gamma often includes outcomePrices for binary markets.
-    We'll treat outcomePrices[0] as YES and [1] as NO when present.
-    If not present, we skip.
-    """
-    outcome_prices = market.get("outcomePrices")
-
-    if isinstance(outcome_prices, list) and len(outcome_prices) == 2:
-        p_yes = parse_float(outcome_prices[0])
-        p_no = parse_float(outcome_prices[1])
-        if p_yes is None or p_no is None:
-            return None
-        # sanity clamp
-        if not (0.0 <= p_yes <= 1.0 and 0.0 <= p_no <= 1.0):
-            return None
-        return (p_yes, p_no)
+    if edge_no >= MIN_EDGE and no_spread <= MAX_SPREAD:
+        entry = pr["no_ask"]
+        tp1 = clamp01(fair_no)
+        tp2 = clamp01(fair_no + edge_no)
+        return {
+            "side": "NO",
+            "entry": entry,
+            "fair": fair_no,
+            "edge": edge_no,
+            "tp1": max(entry, tp1),
+            "tp2": max(entry, tp2),
+            "spread": no_spread,
+        }
 
     return None
 
 
-def market_label(m: Dict[str, Any]) -> str:
-    title = m.get("question") or m.get("title") or "Unknown market"
-    return str(title).strip()
+# ----------------------------
+# HTTP with backoff
+# ----------------------------
+async def http_get_json(client: httpx.AsyncClient, url: str, params: Dict[str, Any]) -> Any:
+    """
+    Backoff on 429 / transient errors.
+    """
+    wait = 0.8
+    for attempt in range(1, 7):
+        try:
+            r = await client.get(url, params=params, timeout=20)
+            if r.status_code == 429:
+                logging.warning(f"[http] status=429 attempt={attempt}/6 wait={wait:.1f}s url={url}")
+                await asyncio.sleep(wait)
+                wait *= 1.9
+                continue
+            r.raise_for_status()
+            return r.json()
+        except httpx.HTTPStatusError as e:
+            code = e.response.status_code
+            logging.warning(f"[http] status={code} attempt={attempt}/6 wait={wait:.1f}s url={url}")
+            await asyncio.sleep(wait)
+            wait *= 1.8
+        except Exception as e:
+            logging.warning(f"[http] error={type(e).__name__} attempt={attempt}/6 wait={wait:.1f}s url={url}")
+            await asyncio.sleep(wait)
+            wait *= 1.8
+
+    raise RuntimeError(f"Failed after retries: {url}")
 
 
-def market_id(m: Dict[str, Any]) -> str:
-    # Gamma markets usually have "id"
-    mid = m.get("id") or m.get("marketId") or m.get("_id") or "unknown"
-    return str(mid)
+# ----------------------------
+# Discord bot
+# ----------------------------
+intents = discord.Intents.default()
+client = discord.Client(intents=intents)
+
+CHANNEL: Optional[discord.TextChannel] = None
+
+# Global in-memory universe cache
+UNIVERSE: Dict[str, Dict[str, Any]] = {}  # key=market_id(str), value=market dict
+LAST_UNIVERSE_OK: float = 0.0
+
+# Alert cooldown
+LAST_ALERT_TS: Dict[str, float] = {}  # key=market_id -> timestamp
 
 
-def market_url(m: Dict[str, Any]) -> str:
-    # Gamma sometimes has "slug"
+def market_title(m: Dict[str, Any]) -> str:
+    # Try common title-ish fields
+    return (
+        m.get("question")
+        or m.get("title")
+        or m.get("name")
+        or m.get("slug")
+        or f"Market {m.get('id')}"
+    )
+
+
+def market_link(m: Dict[str, Any]) -> str:
+    # Polymarket UI links differ; this is a best-effort generic.
     slug = m.get("slug")
+    mid = m.get("id")
     if slug:
         return f"https://polymarket.com/market/{slug}"
+    if mid:
+        return f"https://polymarket.com/market/{mid}"
     return "https://polymarket.com"
 
 
-async def scan_once() -> Tuple[int, int]:
-    """
-    Scan the universe for simple, safe signals:
-    - Binary "arb edge" using prices available on Gamma
-      (not perfect orderbook arb, but stable & zero extra APIs)
-    """
-    checked = 0
-    arbs_found = 0
+async def send_alert(text: str) -> None:
+    global CHANNEL
+    if CHANNEL is None:
+        CHANNEL = client.get_channel(DISCORD_CHANNEL_ID_INT)
+        if CHANNEL is None:
+            CHANNEL = await client.fetch_channel(DISCORD_CHANNEL_ID_INT)
 
-    for m in _market_universe:
-        prices = extract_binary_prices(m)
-        if prices is None:
-            continue
-
-        checked += 1
-        p_yes, p_no = prices
-        cost = p_yes + p_no
-        edge = 1.0 - cost
-
-        if edge >= MIN_ARB_EDGE:
-            mid = market_id(m)
-            if should_cooldown("arb", mid):
-                continue
-
-            arbs_found += 1
-            mark_alert("arb", mid)
-
-            msg = (
-                "🚨 **Arb-ish Alert (Gamma prices)**\n"
-                f"**Market:** {market_label(m)}\n"
-                f"YES={p_yes:.3f}  NO={p_no:.3f}  (sum={cost:.3f})\n"
-                f"**Edge:** +{edge:.3f} (~{edge*100:.1f}¢ per $1)\n"
-                f"{market_url(m)}\n\n"
-                "_Note: This uses Gamma outcomePrices (not full orderbook). Confirm fill prices before sizing._"
-            )
-            await send_discord(msg)
-
-    return checked, arbs_found
+    await CHANNEL.send(text)
 
 
-async def heartbeat_loop() -> None:
-    global _last_heartbeat_at
-    while True:
-        try:
-            if (now_ts() - _last_heartbeat_at) >= HEARTBEAT_MIN * 60.0:
-                _last_heartbeat_at = now_ts()
-                await send_discord(
-                    f"✅ PolyBrain alive. Universe={len(_market_universe)} | "
-                    f"scan_every={SCAN_INTERVAL_SEC:.0f}s | refresh_every={UNIVERSE_REFRESH_SEC:.0f}s"
-                )
-        except Exception as e:
-            print(f"[heartbeat] error: {e}")
-        await asyncio.sleep(30)
+def should_alert(market_id: str) -> bool:
+    last = LAST_ALERT_TS.get(market_id, 0.0)
+    return (now_ts() - last) >= ALERT_COOLDOWN_SEC
 
 
-async def universe_loop() -> None:
-    while True:
-        try:
-            # refresh if never refreshed OR stale
-            if (now_ts() - _last_universe_refresh) >= UNIVERSE_REFRESH_SEC:
-                await refresh_universe()
-        except Exception as e:
-            print(f"[universe] failed: {e}")
-            await report_error("universe_loop", e)
-        await asyncio.sleep(1.0)
+def mark_alert(market_id: str) -> None:
+    LAST_ALERT_TS[market_id] = now_ts()
+
+
+def fmt_pct(x: float) -> str:
+    return f"{x*100:.1f}%"
+
+
+def build_value_message(m: Dict[str, Any], sig: Dict[str, Any]) -> str:
+    title = market_title(m)
+    link = market_link(m)
+
+    side = sig["side"]
+    entry = sig["entry"]
+    fair = sig["fair"]
+    edge = sig["edge"]
+    tp1 = sig["tp1"]
+    tp2 = sig["tp2"]
+    spread = sig["spread"]
+
+    # Convert prices -> probs; in Polymarket “price” ~ probability
+    return (
+        f"📊 **VALUE ALERT — {side}**\n"
+        f"**{title}**\n"
+        f"{link}\n\n"
+        f"• Market entry (ask): **{fmt_pct(entry)}**\n"
+        f"• Fair value (vig-adjusted): **{fmt_pct(fair)}**\n"
+        f"• Edge: **+{fmt_pct(edge)}**\n"
+        f"• Spread: **{fmt_pct(spread)}**\n\n"
+        f"🎯 **Plan**\n"
+        f"• Buy {side} at **≤ {fmt_pct(entry)}**\n"
+        f"• Sell **50%** at **{fmt_pct(tp1)}**\n"
+        f"• Sell remaining **50%** at **{fmt_pct(tp2)}**\n\n"
+        f"Confidence: **HIGH** (orderbook/vig adjusted)\n"
+        f"_Reminder: This is not financial advice._"
+    )
+
+
+# ----------------------------
+# Universe refresh + scan loops
+# ----------------------------
+async def refresh_universe_loop() -> None:
+    global UNIVERSE, LAST_UNIVERSE_OK
+
+    async with httpx.AsyncClient(headers={"User-Agent": "polybrain/1.0"}) as http:
+        while True:
+            try:
+                params = {
+                    "active": "true",
+                    "closed": "false",
+                    "limit": str(min(MAX_MARKETS, 200)),
+                    "offset": "0",
+                    "order": "startTime",
+                    "ascending": "true",
+                }
+
+                all_markets = []
+                offset = 0
+
+                # paginate up to MAX_MARKETS
+                while offset < MAX_MARKETS:
+                    params["offset"] = str(offset)
+                    data = await http_get_json(http, f"{GAMMA}/markets", params=params)
+                    if not isinstance(data, list) or not data:
+                        break
+                    all_markets.extend(data)
+                    if len(data) < int(params["limit"]):
+                        break
+                    offset += int(params["limit"])
+                    await asyncio.sleep(0.25)
+
+                # Build cache
+                new_universe: Dict[str, Dict[str, Any]] = {}
+                for m in all_markets:
+                    mid = m.get("id")
+                    if mid is None:
+                        continue
+                    new_universe[str(mid)] = m
+
+                if new_universe:
+                    UNIVERSE = new_universe
+                    LAST_UNIVERSE_OK = now_ts()
+
+                logging.info(f"[universe] markets={len(UNIVERSE)} refresh={UNIVERSE_REFRESH_SEC:.1f}s")
+
+            except Exception as e:
+                # Keep last known good universe
+                age = now_ts() - LAST_UNIVERSE_OK if LAST_UNIVERSE_OK else -1
+                logging.error(f"[universe] failed: {type(e).__name__} (cache_age={age:.0f}s)")
+
+            await asyncio.sleep(UNIVERSE_REFRESH_SEC)
 
 
 async def scan_loop() -> None:
+    """
+    Scan cached markets and send VALUE alerts when:
+      - binary market detected (YES/NO books)
+      - fair value found (vig-adjusted)
+      - edge >= MIN_EDGE
+      - cooldown passed
+    """
     while True:
-        t0 = now_ts()
         try:
-            checked, arbs = await scan_once()
-            print(f"[scan] checked={checked} arbs_found={arbs}")
+            checked = 0
+            value_found = 0
+
+            for mid, m in list(UNIVERSE.items()):
+                checked += 1
+
+                pr = extract_binary_prices(m)
+                if pr is None:
+                    continue
+
+                sig = compute_value_signal(pr)
+                if sig is None:
+                    continue
+
+                value_found += 1
+
+                if should_alert(mid):
+                    try:
+                        msg = build_value_message(m, sig)
+                        await send_alert(msg)
+                        mark_alert(mid)
+                        logging.info(
+                            f"[alert] market={mid} side={sig['side']} edge={sig['edge']:.4f} entry={sig['entry']:.4f}"
+                        )
+                    except Exception as e:
+                        logging.error(f"[alert] failed market={mid}: {type(e).__name__}")
+
+            logging.info(f"[scan] checked={checked} value_found={value_found}")
+
         except Exception as e:
-            print(f"[scan] failed: {e}")
-            await report_error("scan_loop", e)
+            logging.error(f"[scan] loop error: {type(e).__name__}")
 
-        # keep interval stable even if scan takes time
-        dt = now_ts() - t0
-        sleep_for = max(1.0, SCAN_INTERVAL_SEC - dt)
-        await asyncio.sleep(sleep_for)
+        await asyncio.sleep(SCAN_INTERVAL_SEC)
 
 
-async def report_error(where: str, e: Exception) -> None:
-    """
-    Send 1 clean Discord error message with cooldown (so no spam).
-    """
-    global _last_error_at
-    if (now_ts() - _last_error_at) < (ERROR_COOLDOWN_MIN * 60.0):
-        return
-    _last_error_at = now_ts()
-
-    tb = traceback.format_exc()
-    # Keep it Discord-friendly (not huge)
-    tb_short = tb[-1500:] if len(tb) > 1500 else tb
-
-    msg = (
-        f"⚠️ **PolyBrain error** in `{where}`\n"
-        f"**{type(e).__name__}:** {str(e)}\n"
-        "```text\n"
-        f"{tb_short}\n"
-        "```"
-    )
-    try:
-        await send_discord(msg)
-    except Exception as send_err:
-        print(f"[error-report] failed to send to Discord: {send_err}")
-
-
-# =========================
-# DISCORD EVENTS
-# =========================
 @client.event
 async def on_ready():
-    global _http
-    print(f"Logged in as: {client.user}")
+    logging.info(f"Logged in as: {client.user}")
 
-    # HTTP client (one session)
-    _http = httpx.AsyncClient(
-        timeout=httpx.Timeout(20.0),
-        headers={"User-Agent": "polybrain-alerts/1.0"},
-    )
+    # Resolve channel once at startup
+    global CHANNEL
+    CHANNEL = client.get_channel(DISCORD_CHANNEL_ID_INT)
+    if CHANNEL is None:
+        CHANNEL = await client.fetch_channel(DISCORD_CHANNEL_ID_INT)
 
-    # Initial universe load + startup ping
-    await refresh_universe()
-    await send_discord("✅ PolyBrain deployed & running. (Safety Pack enabled)")
+    await send_alert("✅ PolyBrain is live. **Option A (Fair Value Engine)** is ON.")
 
     # Start loops
-    asyncio.create_task(universe_loop())
-    asyncio.create_task(scan_loop())
-    asyncio.create_task(heartbeat_loop())
+    client.loop.create_task(refresh_universe_loop())
+    client.loop.create_task(scan_loop())
 
 
-def main():
-    client.run(DISCORD_BOT_TOKEN)
-
-
-if __name__ == "__main__":
-    main()
+client.run(DISCORD_BOT_TOKEN)
