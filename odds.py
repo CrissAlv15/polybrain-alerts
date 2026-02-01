@@ -8,16 +8,11 @@ if not ODDS_API_KEY:
 ODDS_BASE = "https://api.the-odds-api.com/v4"
 
 def american_to_prob(american: float) -> float:
-    # implied probability from American odds (no-vig not applied)
     if american < 0:
         return (-american) / ((-american) + 100.0)
     return 100.0 / (american + 100.0)
 
-async def get_h2h_probs(client: httpx.AsyncClient, sport_key: str):
-    """
-    Returns a list of events with consensus-ish H2H implied probabilities.
-    Note: The Odds API returns many books; we’ll use median of implied probs for each side.
-    """
+async def get_h2h_odds_events(client: httpx.AsyncClient, sport_key: str):
     r = await client.get(
         f"{ODDS_BASE}/sports/{sport_key}/odds",
         params={
@@ -41,7 +36,7 @@ def median(xs):
 
 def consensus_probs_from_event(event):
     """
-    event: one odds event. We compute median implied prob for home/away across books.
+    Return median implied probs across books (home and away).
     """
     home = event.get("home_team")
     away = event.get("away_team")
@@ -53,9 +48,7 @@ def consensus_probs_from_event(event):
         for m in markets:
             if m.get("key") != "h2h":
                 continue
-            outcomes = m.get("outcomes") or []
-            # outcomes include names + price (american)
-            for o in outcomes:
+            for o in (m.get("outcomes") or []):
                 name = o.get("name")
                 price = o.get("price")
                 if price is None:
