@@ -577,9 +577,10 @@ async def heartbeat_loop() -> None:
                 f"🧱 HTTP 4xx: **{STATS['http_4xx']}** | HTTP 5xx: **{STATS['http_5xx']}**\n"
             )
             if STATS["last_error"]:
-                msg += f"\n🔴 Last error: `{str(STATS['last_error'])[:180]}`\n"
-all_ok = "🟢 Status: **Running**"
-            msg += f"\n{all_ok}"
+    msg += f"\n🔴 Last error: `{str(STATS['last_error'])[:180]}`"
+
+    all_ok = "🟢 Status: **Running**"
+    msg += f"\n{all_ok}"
 
             await send_discord(msg)
 
