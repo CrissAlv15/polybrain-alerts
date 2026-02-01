@@ -1,266 +1,358 @@
 import os
 import time
+import json
+import math
 import asyncio
-import re
-from typing import List, Dict, Any, Tuple, Optional
+import logging
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Tuple
 
-import httpx
+import aiohttp
+import discord
 
-from discord_alerts import client, send
-from polymarket import list_active_markets, extract_sports_h2h_markets
-from odds import get_h2h_odds_events, consensus_probs_from_event
-from signals import detect_value, detect_arb_candidate
+# -----------------------------
+# Config (env vars)
+# -----------------------------
+DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
+DISCORD_CHANNEL_ID = os.getenv("DISCORD_CHANNEL_ID")
 
-# =========================
-# Config (Railway Variables)
-# =========================
-SCAN_SECONDS = int(os.getenv("SCAN_SECONDS", "30"))
-COOLDOWN_MINUTES = int(os.getenv("COOLDOWN_MINUTES", "60"))
-VALUE_THRESHOLD = float(os.getenv("VALUE_THRESHOLD", "0.07"))
+SCAN_INTERVAL_SEC = int(os.getenv("SCAN_INTERVAL_SEC", "20"))          # how often we scan prices
+UNIVERSE_REFRESH_SEC = int(os.getenv("UNIVERSE_REFRESH_SEC", "600"))   # refresh market list
+MAX_EVENTS_PER_LEAGUE = int(os.getenv("MAX_EVENTS_PER_LEAGUE", "200")) # safety cap
 
-# Odds sports keys (both NHL + NBA by default)
-SPORT_KEYS = os.getenv("SPORT_KEYS", "icehockey_nhl,basketball_nba").split(",")
+# Alert thresholds (tune later)
+ARB_BUFFER = float(os.getenv("ARB_BUFFER", "0.010"))     # require sum(yes_buy + no_buy) < 1 - buffer
+MIN_LIQUIDITY = float(os.getenv("MIN_LIQUIDITY", "200")) # minimum top-of-book size to consider "safe"
+MAX_SPREAD = float(os.getenv("MAX_SPREAD", "0.12"))      # skip if spread too wide
+MOVE_ALERT = float(os.getenv("MOVE_ALERT", "0.09"))      # price change trigger (9%)
+Z_ALERT = float(os.getenv("Z_ALERT", "2.5"))             # z-score trigger for "value"
+COOLDOWN_SEC = int(os.getenv("COOLDOWN_SEC", "300"))     # per-market alert cooldown
 
-# Limit how many Polymarket markets we page through (keep it safe for free tiers)
-POLY_PAGES = int(os.getenv("POLY_PAGES", "3"))  # each page = 200 markets
+if not DISCORD_BOT_TOKEN or not DISCORD_CHANNEL_ID:
+    raise SystemExit("Missing DISCORD_BOT_TOKEN or DISCORD_CHANNEL_ID")
 
-# Matching strictness
-MATCH_SCORE_MIN = float(os.getenv("MATCH_SCORE_MIN", "0.20"))
+CHANNEL_ID_INT = int(DISCORD_CHANNEL_ID)
 
-# =========================
-# State
-# =========================
-last_alert_at: Dict[str, float] = {}  # key -> epoch
+GAMMA = "https://gamma-api.polymarket.com"
+CLOB = "https://clob.polymarket.com"
 
-def can_alert(key: str) -> bool:
-    now = time.time()
-    last = last_alert_at.get(key, 0.0)
-    return (now - last) >= (COOLDOWN_MINUTES * 60)
+# -----------------------------
+# Logging
+# -----------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+log = logging.getLogger("polybrain")
 
-def mark_alert(key: str) -> None:
-    last_alert_at[key] = time.time()
+# -----------------------------
+# Helpers / Models
+# -----------------------------
+def now_ts() -> float:
+    return time.time()
 
-# =========================
-# Matching helpers
-# =========================
-def norm(s: str) -> str:
-    s = (s or "").lower()
-    s = s.replace("&", " and ")
-    s = re.sub(r"[^a-z0-9\s]", " ", s)
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
+def clamp(x: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, x))
 
-def token_set(s: str) -> set:
-    return set(norm(s).split())
+@dataclass
+class MarketInfo:
+    market_id: str
+    event_id: str
+    event_title: str
+    league: str
+    question: str
+    slug: Optional[str]
+    token_yes: str
+    token_no: str
 
-def jaccard(a: set, b: set) -> float:
-    if not a or not b:
+@dataclass
+class MarketState:
+    # rolling window for yes price
+    prices: List[Tuple[float, float]] = field(default_factory=list)  # (ts, price_yes)
+    last_alert_ts: float = 0.0
+
+    def add_price(self, ts: float, p: float, window_sec: int = 1800) -> None:
+        self.prices.append((ts, p))
+        cutoff = ts - window_sec
+        while self.prices and self.prices[0][0] < cutoff:
+            self.prices.pop(0)
+
+    def stats(self) -> Tuple[Optional[float], Optional[float]]:
+        if len(self.prices) < 8:
+            return None, None
+        vals = [p for _, p in self.prices]
+        mean = sum(vals) / len(vals)
+        var = sum((v - mean) ** 2 for v in vals) / max(1, (len(vals) - 1))
+        sd = math.sqrt(var) if var > 0 else 0.0
+        return mean, sd
+
+# -----------------------------
+# Polymarket API calls
+# -----------------------------
+async def http_get_json(session: aiohttp.ClientSession, url: str, params: Optional[dict] = None) -> dict:
+    async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=20)) as r:
+        r.raise_for_status()
+        return await r.json()
+
+async def fetch_sports_leagues(session: aiohttp.ClientSession) -> List[dict]:
+    # docs: GET https://gamma-api.polymarket.com/sports  [oai_citation:2‡Polymarket Documentation](https://docs.polymarket.com/quickstart/fetching-data)
+    return await http_get_json(session, f"{GAMMA}/sports")
+
+async def fetch_events_for_league(session: aiohttp.ClientSession, series_id: int, limit: int = 200) -> List[dict]:
+    # docs: GET /events?series_id=...&active=true&closed=false  [oai_citation:3‡Polymarket Documentation](https://docs.polymarket.com/quickstart/fetching-data)
+    params = {
+        "series_id": series_id,
+        "active": "true",
+        "closed": "false",
+        "limit": str(limit),
+        "order": "startTime",
+        "ascending": "true",
+    }
+    return await http_get_json(session, f"{GAMMA}/events", params=params)
+
+async def clob_price(session: aiohttp.ClientSession, token_id: str, side: str = "buy") -> Optional[float]:
+    # docs: GET https://clob.polymarket.com/price?token_id=...&side=buy  [oai_citation:4‡Polymarket Documentation](https://docs.polymarket.com/quickstart/fetching-data)
+    data = await http_get_json(session, f"{CLOB}/price", params={"token_id": token_id, "side": side})
+    try:
+        return float(data["price"])
+    except Exception:
+        return None
+
+async def clob_book(session: aiohttp.ClientSession, token_id: str) -> Optional[dict]:
+    # docs: GET https://clob.polymarket.com/book?token_id=...  [oai_citation:5‡Polymarket Documentation](https://docs.polymarket.com/quickstart/fetching-data)
+    return await http_get_json(session, f"{CLOB}/book", params={"token_id": token_id})
+
+def parse_outcomes(event_market: dict) -> Optional[Tuple[str, str]]:
+    # Polymarket returns clobTokenIds [YES, NO] for binary markets in examples  [oai_citation:6‡Polymarket Documentation](https://docs.polymarket.com/quickstart/fetching-data)
+    ids = event_market.get("clobTokenIds")
+    if not ids or len(ids) < 2:
+        return None
+    return str(ids[0]), str(ids[1])
+
+# -----------------------------
+# Discord
+# -----------------------------
+intents = discord.Intents.default()
+client = discord.Client(intents=intents)
+
+async def send_discord(channel_id: int, text: str) -> None:
+    channel = client.get_channel(channel_id)
+    if channel is None:
+        channel = await client.fetch_channel(channel_id)
+    await channel.send(text)
+
+# -----------------------------
+# Intelligence: Phase 1 signals
+# -----------------------------
+def spread_from_book(book: dict) -> Tuple[Optional[float], Optional[float], Optional[float], Optional[float]]:
+    bids = book.get("bids") or []
+    asks = book.get("asks") or []
+    if not bids or not asks:
+        return None, None, None, None
+    best_bid = float(bids[0]["price"])
+    best_ask = float(asks[0]["price"])
+    bid_sz = float(bids[0].get("size", 0))
+    ask_sz = float(asks[0].get("size", 0))
+    return best_bid, best_ask, bid_sz, ask_sz
+
+def zscore(x: float, mean: float, sd: float) -> float:
+    if sd <= 1e-9:
         return 0.0
-    return len(a & b) / len(a | b)
+    return (x - mean) / sd
 
-# Practical alias starter pack (you can expand over time)
-ALIASES = {
-    # NHL
-    "new jersey devils": ["nj devils", "devils", "new jersey"],
-    "new york rangers": ["ny rangers", "rangers"],
-    "new york islanders": ["ny islanders", "islanders"],
-    "tampa bay lightning": ["lightning", "tampa bay"],
-    "vegas golden knights": ["vegas", "golden knights", "knights"],
-    "washington capitals": ["capitals", "caps", "washington"],
-    "toronto maple leafs": ["maple leafs", "leafs", "toronto"],
-    "boston bruins": ["bruins", "boston"],
-    "montreal canadiens": ["canadiens", "habs", "montreal"],
-    "carolina hurricanes": ["hurricanes", "canes", "carolina"],
-    "florida panthers": ["panthers", "florida"],
-    "edmonton oilers": ["oilers", "edmonton"],
-    "calgary flames": ["flames", "calgary"],
+def build_sell_plan(current: float) -> str:
+    # Simple, consistent “two-take-profit + stop” plan
+    # (not trading advice; just a template)
+    tp1 = clamp(current + 0.06, 0.02, 0.98)
+    tp2 = clamp(current + 0.12, 0.02, 0.98)
+    stp = clamp(current - 0.07, 0.02, 0.98)
+    return f"Plan: TP1 50% @ {tp1:.2f} | TP2 50% @ {tp2:.2f} | Stop @ {stp:.2f}"
 
-    # NBA
-    "los angeles lakers": ["la lakers", "lakers"],
-    "los angeles clippers": ["la clippers", "clippers"],
-    "golden state warriors": ["warriors", "gsw", "golden state"],
-    "new york knicks": ["knicks"],
-    "brooklyn nets": ["nets"],
-    "boston celtics": ["celtics", "boston"],
-    "miami heat": ["heat", "miami"],
-    "milwaukee bucks": ["bucks"],
-    "denver nuggets": ["nuggets"],
-    "phoenix suns": ["suns"],
-    "dallas mavericks": ["mavs", "mavericks", "dallas"],
-    "minnesota timberwolves": ["wolves", "timberwolves", "minnesota"],
-}
+# -----------------------------
+# Bot state
+# -----------------------------
+MARKETS: Dict[str, MarketInfo] = {}
+STATE: Dict[str, MarketState] = {}
 
-def name_variants(team_name: str) -> List[str]:
-    t = norm(team_name)
-    out = {t}
-    for canon, alts in ALIASES.items():
-        if norm(canon) == t:
-            out.update(norm(x) for x in alts)
-    return sorted(out)
+async def refresh_universe_loop():
+    global MARKETS
+    async with aiohttp.ClientSession() as session:
+        while True:
+            try:
+                leagues = await fetch_sports_leagues(session)
+                new_markets: Dict[str, MarketInfo] = {}
+                total_events = 0
+                total_markets = 0
 
-def best_event_match(polymarket_text: str, events: List[Dict[str, Any]]) -> Tuple[Optional[Dict[str, Any]], float]:
-    q_tokens = token_set(polymarket_text)
-    best = None
-    best_score = 0.0
+                for lg in leagues:
+                    series_id = lg.get("series_id") or lg.get("seriesId") or lg.get("id")
+                    league_name = lg.get("name") or lg.get("league") or "sports"
+                    if series_id is None:
+                        continue
 
-    for ev in events:
-        home = ev.get("home_team") or ""
-        away = ev.get("away_team") or ""
-        home_vars = name_variants(home)
-        away_vars = name_variants(away)
+                    events = await fetch_events_for_league(session, int(series_id), limit=MAX_EVENTS_PER_LEAGUE)
+                    if not isinstance(events, list):
+                        continue
 
-        home_best = max((jaccard(q_tokens, token_set(v)) for v in home_vars), default=0.0)
-        away_best = max((jaccard(q_tokens, token_set(v)) for v in away_vars), default=0.0)
+                    total_events += len(events)
 
-        # Need both teams to appear somewhat
-        score = (home_best + away_best) / 2.0
+                    for ev in events:
+                        ev_id = str(ev.get("id", ""))
+                        title = ev.get("title") or ev.get("slug") or "Event"
+                        markets = ev.get("markets") or []
+                        for m in markets:
+                            tokens = parse_outcomes(m)
+                            if not tokens:
+                                continue
+                            token_yes, token_no = tokens
+                            market_id = str(m.get("id", "")) or f"{ev_id}:{token_yes}"
+                            q = m.get("question") or title
+                            slug = m.get("slug")
+                            mi = MarketInfo(
+                                market_id=market_id,
+                                event_id=ev_id,
+                                event_title=title,
+                                league=str(league_name),
+                                question=str(q),
+                                slug=str(slug) if slug else None,
+                                token_yes=token_yes,
+                                token_no=token_no,
+                            )
+                            new_markets[market_id] = mi
+                            total_markets += 1
 
-        if score > best_score:
-            best_score = score
-            best = ev
+                MARKETS = new_markets
+                log.info(f"[universe] leagues={len(leagues)} events≈{total_events} markets={len(MARKETS)}")
+            except Exception as e:
+                log.exception(f"[universe] failed: {e}")
 
-    return best, best_score
+            await asyncio.sleep(UNIVERSE_REFRESH_SEC)
 
-def outcome_mentions(team: str, outcome_text: str) -> bool:
-    o = norm(outcome_text)
-    for v in name_variants(team):
-        if v and v in o:
-            return True
-    return False
+async def scan_loop():
+    async with aiohttp.ClientSession() as session:
+        while True:
+            t0 = now_ts()
+            markets_list = list(MARKETS.values())
+            checked = 0
+            matched = 0
+            value_found = 0
+            arbs_found = 0
 
-# =========================
-# Main scanning logic
-# =========================
-async def load_polymarket_sports_markets(http: httpx.AsyncClient) -> List[Dict[str, Any]]:
-    poly_all = []
-    for i in range(POLY_PAGES):
-        raw = await list_active_markets(http, limit=200, offset=i * 200)
-        poly_all.extend(raw)
-    return extract_sports_h2h_markets(poly_all)
+            # Light throttling: scan in chunks
+            for mi in markets_list:
+                checked += 1
+                st = STATE.setdefault(mi.market_id, MarketState())
 
-async def load_odds_events(http: httpx.AsyncClient) -> List[Dict[str, Any]]:
-    events: List[Dict[str, Any]] = []
-    for sk in [x.strip() for x in SPORT_KEYS if x.strip()]:
-        try:
-            data = await get_h2h_odds_events(http, sk)
-            for ev in data:
-                c = consensus_probs_from_event(ev)
-                if c.get("home_p") and c.get("away_p"):
-                    events.append(c)
-        except Exception as e:
-            print(f"[odds] sport={sk} error={repr(e)}")
-    return events
+                try:
+                    # Prices (buy side)
+                    py = await clob_price(session, mi.token_yes, side="buy")
+                    pn = await clob_price(session, mi.token_no, side="buy")
+                    if py is None or pn is None:
+                        continue
 
-def map_polymarket_side_to_fair(market: Dict[str, Any], ev: Dict[str, Any]) -> Optional[Tuple[str, float, float]]:
-    """
-    Returns (side_name, poly_price, fair_prob) for outcome[0] only.
-    (We use outcome[0] as the "YES" side in Polymarket-style pricing.)
-    """
-    q = market.get("question") or ""
-    outcomes = market.get("outcomes") or []
-    prices = market.get("prices") or []
-    if len(outcomes) != 2 or len(prices) != 2:
-        return None
+                    st.add_price(t0, py)
 
-    home = ev.get("home_team") or ""
-    away = ev.get("away_team") or ""
-    home_p = ev.get("home_p")
-    away_p = ev.get("away_p")
-    if home_p is None or away_p is None:
-        return None
+                    # Orderbook (for spread/liquidity checks)
+                    by = await clob_book(session, mi.token_yes)
+                    if not by:
+                        continue
+                    bid, ask, bid_sz, ask_sz = spread_from_book(by)
+                    if bid is None or ask is None:
+                        continue
 
-    out0 = outcomes[0] or ""
-    poly_p = float(prices[0])
+                    spread = ask - bid
+                    # basic filters
+                    if spread > MAX_SPREAD:
+                        continue
+                    if min(bid_sz or 0, ask_sz or 0) < MIN_LIQUIDITY:
+                        # still track, but avoid firing “strong” signals
+                        pass
 
-    # Determine which team outcome[0] refers to
-    if outcome_mentions(home, out0) or outcome_mentions(home, q):
-        return (home, poly_p, float(home_p))
-    if outcome_mentions(away, out0) or outcome_mentions(away, q):
-        return (away, poly_p, float(away_p))
+                    matched += 1
 
-    return None
+                    # Cooldown check
+                    if (t0 - st.last_alert_ts) < COOLDOWN_SEC:
+                        continue
 
-async def scan_once() -> None:
-    async with httpx.AsyncClient() as http:
-        poly_markets = await load_polymarket_sports_markets(http)
-        events = await load_odds_events(http)
+                    # 1) Arb: buy YES + buy NO < 1 - buffer
+                    cost_both = py + pn
+                    if cost_both < (1.0 - ARB_BUFFER):
+                        arbs_found += 1
+                        st.last_alert_ts = t0
+                        msg = (
+                            f"🟢 **ARB FOUND** ({mi.league})\n"
+                            f"**{mi.question}**\n"
+                            f"YES buy: {py:.3f} | NO buy: {pn:.3f} | sum: {cost_both:.3f}\n"
+                            f"Spread(YES): {spread:.3f} | TopSize≈{min(bid_sz, ask_sz):.0f}\n"
+                            f"_MarketID: {mi.market_id}_"
+                        )
+                        await send_discord(CHANNEL_ID_INT, msg)
+                        continue
 
-        checked = 0
-        matched = 0
-        values = 0
-        arbs = 0
+                    # 2) Momentum move
+                    if len(st.prices) >= 2:
+                        prev = st.prices[-2][1]
+                        move = py - prev
+                        if abs(move) >= MOVE_ALERT:
+                            value_found += 1
+                            st.last_alert_ts = t0
+                            direction = "UP ⬆️" if move > 0 else "DOWN ⬇️"
+                            msg = (
+                                f"⚡ **MOMENTUM {direction}** ({mi.league})\n"
+                                f"**{mi.question}**\n"
+                                f"YES buy: {py:.3f} (Δ {move:+.3f} since last scan)\n"
+                                f"{build_sell_plan(py)}\n"
+                                f"_MarketID: {mi.market_id}_"
+                            )
+                            await send_discord(CHANNEL_ID_INT, msg)
+                            continue
 
-        for m in poly_markets:
-            checked += 1
-            q = m.get("question") or ""
-            match, score = best_event_match(q, events)
+                    # 3) “Value” via z-score vs rolling window
+                    mean, sd = st.stats()
+                    if mean is not None and sd is not None and sd > 0:
+                        z = zscore(py, mean, sd)
+                        if abs(z) >= Z_ALERT:
+                            value_found += 1
+                            st.last_alert_ts = t0
+                            side = "CHEAP ✅" if z < 0 else "EXPENSIVE ⚠️"
+                            msg = (
+                                f"📌 **VALUE SIGNAL** {side} ({mi.league})\n"
+                                f"**{mi.question}**\n"
+                                f"YES buy: {py:.3f} | mean: {mean:.3f} | sd: {sd:.3f} | z: {z:+.2f}\n"
+                                f"{build_sell_plan(py)}\n"
+                                f"_MarketID: {mi.market_id}_"
+                            )
+                            await send_discord(CHANNEL_ID_INT, msg)
+                            continue
 
-            if not match or score < MATCH_SCORE_MIN:
-                continue
+                except Exception as e:
+                    # Keep scanning even if one market fails
+                    log.debug(f"[scan] market failed {mi.market_id}: {e}")
+                    continue
 
-            mapped = map_polymarket_side_to_fair(m, match)
-            if not mapped:
-                continue
+                # Small delay to avoid hammering endpoints
+                if checked % 25 == 0:
+                    await asyncio.sleep(0.3)
 
-            matched += 1
-            side, poly_p, fair_p = mapped
-            market_id = m.get("id")
-            key_base = f"{market_id}:{norm(side)}"
-
-            # VALUE
-            v = detect_value(poly_p=poly_p, fair_p=fair_p, threshold=VALUE_THRESHOLD)
-            if v and can_alert(key_base):
-                values += 1
-                mark_alert(key_base)
-
-                tp1 = int(v["tp1"] * 100)
-                tp2 = int(v["tp2"] * 100)
-
-                msg = (
-                    f"📣 **VALUE ALERT** — **{side}**\n"
-                    f"• Market: {q}\n"
-                    f"• Polymarket: **{int(poly_p*100)}¢** (implied {int(poly_p*100)}%)\n"
-                    f"• Sportsbook fair: **{int(fair_p*100)}%**\n"
-                    f"• Edge: **+{v['edge']*100:.1f}%**\n"
-                    f"• Match score: **{score:.2f}**\n\n"
-                    f"**Plan**\n"
-                    f"• Entry: buy ≤ **{int(poly_p*100)}¢** (or better)\n"
-                    f"• Sell 50%: **{tp1}¢** (or when edge < +{int(VALUE_THRESHOLD*100)}%)\n"
-                    f"• Sell rest: **{tp2}¢** (or near game-time risk)\n"
-                    f"• Risk note: if major lineup/injury news flips odds, exit.\n"
-                    + (f"\n{m['url']}" if m.get("url") else "")
-                )
-                await send(msg)
-
-            # ARB candidate (only if no value)
-            if not v:
-                a = detect_arb_candidate(poly_p=poly_p, fair_p=fair_p, threshold=0.10)
-                if a and can_alert(key_base + ":arb"):
-                    arbs += 1
-                    mark_alert(key_base + ":arb")
-                    msg = (
-                        f"⚡ **ARB CANDIDATE** — {side}\n"
-                        f"• Market: {q}\n"
-                        f"• Polymarket: **{int(poly_p*100)}¢** vs fair **{int(fair_p*100)}%**\n"
-                        f"• Off by: **{a['diff']*100:.1f}%**\n"
-                        f"• Action: verify your sportsbook line still exists before taking.\n"
-                        f"• Match score: **{score:.2f}**\n"
-                        + (f"\n{m['url']}" if m.get("url") else "")
-                    )
-                    await send(msg)
-
-        print(f"[scan] checked={checked} matched={matched} value_found={values} arbs_found={arbs}")
+            log.info(f"[scan] checked={checked} matched={matched} value_found={value_found} arbs_found={arbs_found}")
+            elapsed = now_ts() - t0
+            sleep_for = max(1, SCAN_INTERVAL_SEC - int(elapsed))
+            await asyncio.sleep(sleep_for)
 
 @client.event
 async def on_ready():
-    print(f"Logged in as: {client.user}")
-    await send("✅ PolyBrain is live. Scanning NHL+NBA (odds-based value + arb candidates).")
-    while True:
-        try:
-            await scan_once()
-        except Exception as e:
-            print(f"[fatal] {repr(e)}")
-        await asyncio.sleep(SCAN_SECONDS)
+    log.info(f"Logged in as: {client.user}")
+    try:
+        await send_discord(CHANNEL_ID_INT, "✅ PolyBrain Phase 1 is live (sports universe + arb/value/momentum).")
+    except Exception as e:
+        log.error(f"Failed to send startup message: {e}")
+
+    # Start loops
+    client.loop.create_task(refresh_universe_loop())
+    client.loop.create_task(scan_loop())
+
+def main():
+    client.run(DISCORD_BOT_TOKEN)
 
 if __name__ == "__main__":
-    client.run(os.getenv("DISCORD_BOT_TOKEN"))
+    main()
