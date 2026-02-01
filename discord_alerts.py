@@ -10,6 +10,8 @@ if not TOKEN or not CHANNEL_ID:
 CHANNEL_ID_INT = int(CHANNEL_ID)
 
 intents = discord.Intents.default()
+intents.guilds = True
+
 client = discord.Client(intents=intents)
 
 _channel_cache = None
@@ -21,7 +23,6 @@ async def get_channel():
 
     ch = client.get_channel(CHANNEL_ID_INT)
     if ch is None:
-        # Fallback fetch
         ch = await client.fetch_channel(CHANNEL_ID_INT)
 
     _channel_cache = ch
