@@ -1,20 +1,23 @@
 import os
 import re
-import json
 import time
+import json
+import html
 import asyncio
 import logging
 from typing import Any, Dict, List, Optional, Tuple
+from dataclasses import dataclass
+from datetime import datetime, timezone
 
 import httpx
 import discord
+from xml.etree import ElementTree as ET
 
 # =========================
 # LOGGING
 # =========================
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper().strip()
 logging.basicConfig(
-    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
 
@@ -29,226 +32,285 @@ CHANNEL_ID = int(DISCORD_CHANNEL_ID)
 
 GAMMA = os.getenv("POLY_GAMMA_BASE", "https://gamma-api.polymarket.com").strip().rstrip("/")
 
-# You want ONLY what you see in the app, and NO UFC.
-SPORTS_ALLOW = set(
-    s.strip().lower()
-    for s in os.getenv("SPORTS_MODE", "nfl,nba,nhl,cbb,cfb").split(",")
-    if s.strip()
-)
-SPORTS_EXCLUDE = set(
-    s.strip().lower()
-    for s in os.getenv("SPORTS_EXCLUDE", "ufc,mma").split(",")
-    if s.strip()
-)
+# Sports only (NO UFC). These are the “tabs” you care about.
+SPORTS_MODE = os.getenv("SPORTS_MODE", "nfl,nba,nhl,cbb,cfb").strip().lower()
+SPORTS_ALLOW = {s.strip() for s in SPORTS_MODE.split(",") if s.strip()}
 
-# Universe refresh + scan pacing
-UNIVERSE_REFRESH_SEC = float(os.getenv("UNIVERSE_REFRESH_SEC", "30"))  # refresh markets list
-SCAN_INTERVAL_SEC = float(os.getenv("SCAN_INTERVAL_SEC", "12"))        # scan loop
+# Polling / thresholds (tuned for “higher quality”)
+SCAN_EVERY_SEC = float(os.getenv("SCAN_EVERY_SEC", "15").strip() or "15")
+UNIVERSE_REFRESH_SEC = float(os.getenv("UNIVERSE_REFRESH_SEC", "60").strip() or "60")
+NEWS_REFRESH_SEC = float(os.getenv("NEWS_REFRESH_SEC", "90").strip() or "90")
 
-# API paging
-MARKETS_PAGE_LIMIT = int(os.getenv("MARKETS_PAGE_LIMIT", "200"))
-MARKETS_MAX_PAGES = int(os.getenv("MARKETS_MAX_PAGES", "15"))  # 15*200=3000 max
+# “Edge” thresholds (you can lower tomorrow)
+ARB_SUM_MAX = float(os.getenv("ARB_SUM_MAX", "0.97").strip() or "0.97")  # yes+no <= 0.97 => arb-ish
+MOVE_ALERT_CENTS = float(os.getenv("MOVE_ALERT_CENTS", "8").strip() or "8")  # price move in cents for news alert
+NEWS_MATCH_MIN = int(os.getenv("NEWS_MATCH_MIN", "1").strip() or "1")
 
-# News ingestion
-NEWS_ENABLED = os.getenv("NEWS_ENABLED", "1").strip() not in ("0", "false", "False")
-NEWS_REFRESH_SEC = float(os.getenv("NEWS_REFRESH_SEC", "180"))  # pull RSS every 3 min
-NEWS_TERMS_MAX = int(os.getenv("NEWS_TERMS_MAX", "120"))
+# Universe paging
+MARKETS_PAGE_LIMIT = int(os.getenv("MARKETS_PAGE_LIMIT", "200").strip() or "200")
+MARKETS_MAX_PAGES = int(os.getenv("MARKETS_MAX_PAGES", "8").strip() or "8")  # 8*200=1600 max
 
-# Feeds (defaults = 5 feeds)
-DEFAULT_NEWS_FEEDS = [
-    # NFL
+# News feeds (simple + reliable; you can add/remove anytime)
+# NOTE: These are RSS feeds, no extra packages needed.
+DEFAULT_FEEDS = [
+    # General sports headlines
+    "https://www.espn.com/espn/rss/news",
+    "https://sports.yahoo.com/rss/",
+    # NFL / NBA / NHL / CBB / CFB buckets
     "https://www.espn.com/espn/rss/nfl/news",
-    # NBA
     "https://www.espn.com/espn/rss/nba/news",
-    # NHL
     "https://www.espn.com/espn/rss/nhl/news",
-    # CFB
-    "https://www.espn.com/espn/rss/ncf/news",
-    # CBB
     "https://www.espn.com/espn/rss/ncb/news",
+    "https://www.espn.com/espn/rss/ncf/news",
 ]
-NEWS_FEEDS = [u.strip() for u in os.getenv("NEWS_FEEDS", ",".join(DEFAULT_NEWS_FEEDS)).split(",") if u.strip()]
+NEWS_FEEDS = os.getenv("NEWS_FEEDS", "").strip()
+FEEDS = [f.strip() for f in NEWS_FEEDS.split(",") if f.strip()] if NEWS_FEEDS else DEFAULT_FEEDS
 
-# Optional: only alert if "confidence score" >= this number (0-100)
-ALERT_SCORE_MIN = int(os.getenv("ALERT_SCORE_MIN", "85"))
-
-# =========================
-# DISCORD CLIENT
-# =========================
-intents = discord.Intents.default()
-client = discord.Client(intents=intents)
+# Rate-limit/backoff
+HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "15").strip() or "15")
+MAX_HTTP_RETRIES = int(os.getenv("MAX_HTTP_RETRIES", "6").strip() or "6")
 
 # =========================
-# STATE / STATS
+# STATE
 # =========================
-STATE: Dict[str, Any] = {
-    "universe": [],          # filtered markets list
-    "universe_ts": 0.0,
-    "news_terms": set(),     # extracted terms
-    "news_ts": 0.0,
-}
-
 STATS: Dict[str, Any] = {
-    "universe_markets": 0,
     "markets_scanned": 0,
     "value_found": 0,
     "alerts_sent": 0,
     "rate_limits": 0,
+    "universe_markets": 0,
+    "news_terms": 0,
     "http_4xx": 0,
     "http_5xx": 0,
     "last_error": None,
 }
 
+# Universe cache
+UNIVERSE: List[Dict[str, Any]] = []
+UNIVERSE_BY_ID: Dict[str, Dict[str, Any]] = {}
+
+# Price memory (for movement detection)
+LAST_PRICE: Dict[str, float] = {}          # market_id -> last mid (0..1)
+LAST_PRICE_TS: Dict[str, float] = {}       # market_id -> time.time()
+
+# News memory
+NEWS_ITEMS_SEEN: set = set()               # item guid/link hash
+NEWS_TERMS: Dict[str, int] = {}            # term -> count recent
+NEWS_RECENT: List[Dict[str, str]] = []     # last N items
+NEWS_RECENT_MAX = 80
+
+# Alert de-dup (avoid spamming same market)
+ALERT_COOLDOWN_SEC = 30 * 60
+LAST_ALERT_TS: Dict[str, float] = {}       # key -> time.time()
+
 # =========================
-# HELPERS
+# DISCORD SETUP
 # =========================
-def _norm(s: str) -> str:
-    return re.sub(r"[^a-z0-9]+", " ", (s or "").lower()).strip()
+intents = discord.Intents.default()
+client = discord.Client(intents=intents)
 
-def _collect_market_tokens(m: Dict[str, Any]) -> List[str]:
-    """
-    Collect possible category/league identifiers from market objects.
-    Defensive: Polymarket fields can vary.
-    """
-    tokens: List[str] = []
-
-    for k in ("category", "group", "subcategory", "eventSlug", "slug", "title", "question"):
-        v = m.get(k)
-        if isinstance(v, str) and v.strip():
-            tokens.append(_norm(v))
-
-    tags = m.get("tags")
-    if isinstance(tags, list):
-        for t in tags:
-            if isinstance(t, dict):
-                tokens.append(_norm(t.get("slug", "")))
-                tokens.append(_norm(t.get("name", "")))
-            elif isinstance(t, str):
-                tokens.append(_norm(t))
-
-    event = m.get("event")
-    if isinstance(event, dict):
-        tokens.append(_norm(event.get("slug", "")))
-        tokens.append(_norm(event.get("title", "")))
-        tokens.append(_norm(event.get("category", "")))
-
-    series = m.get("series")
-    if isinstance(series, dict):
-        tokens.append(_norm(series.get("slug", "")))
-        tokens.append(_norm(series.get("title", "")))
-
-    blob = " ".join(tokens)
-    return [t for t in blob.split() if t]
-
-def is_allowed_sport_market(m: Dict[str, Any]) -> bool:
-    """
-    Option A: metadata-first filter + hard exclude UFC/MMA.
-    """
-    tokens = _collect_market_tokens(m)
-    if not tokens:
-        return False
-    tokset = set(tokens)
-
-    if tokset & SPORTS_EXCLUDE:
-        return False
-    return bool(tokset & SPORTS_ALLOW)
-
-def _market_text(m: Dict[str, Any]) -> str:
-    # used for news term matching
-    parts = []
-    for k in ("question", "title", "slug"):
-        v = m.get(k)
-        if isinstance(v, str) and v.strip():
-            parts.append(v)
-    event = m.get("event")
-    if isinstance(event, dict):
-        for k in ("title", "slug"):
-            v = event.get(k)
-            if isinstance(v, str) and v.strip():
-                parts.append(v)
-    return _norm(" ".join(parts))
+async def get_channel() -> discord.TextChannel:
+    ch = client.get_channel(CHANNEL_ID)
+    if ch is None:
+        # fetch_channel requires bot to have access
+        ch = await client.fetch_channel(CHANNEL_ID)
+    return ch  # type: ignore
 
 async def send_discord(msg: str) -> None:
-    """
-    Robust send: tries cached channel, otherwise fetches.
-    """
     try:
-        ch = client.get_channel(CHANNEL_ID)
-        if ch is None:
-            ch = await client.fetch_channel(CHANNEL_ID)
+        ch = await get_channel()
         await ch.send(msg)
+        STATS["alerts_sent"] += 1
     except Exception as e:
-        logging.error(f"[discord] send failed: {type(e).__name__}: {e}")
-
-def _cut(s: str, n: int = 1800) -> str:
-    return s if len(s) <= n else s[: n - 3] + "..."
+        STATS["last_error"] = f"discord_send: {type(e).__name__}: {e}"
+        logging.error("Discord send failed: %s", STATS["last_error"])
 
 # =========================
-# HTTP (with backoff)
+# HTTP HELPERS
 # =========================
-async def http_get_json(
-    hc: httpx.AsyncClient,
-    url: str,
-    params: Optional[Dict[str, Any]] = None,
-    timeout: float = 20.0,
-    attempts: int = 6,
-) -> Any:
+async def http_get_text(hc: httpx.AsyncClient, url: str, params: Optional[dict] = None) -> str:
+    last_err = None
     wait = 0.8
-    last_err: Optional[str] = None
-
-    for i in range(1, attempts + 1):
+    for attempt in range(1, MAX_HTTP_RETRIES + 1):
         try:
-            r = await hc.get(url, params=params, timeout=timeout)
+            r = await hc.get(url, params=params, timeout=HTTP_TIMEOUT)
             status = r.status_code
-
             if status == 429:
                 STATS["rate_limits"] += 1
-                logging.warning(f"[http] status=429 attempt={i}/{attempts} wait={wait:.1f}s url={url}")
+                logging.warning("[http] status=429 attempt=%d/%d wait=%.1fs url=%s", attempt, MAX_HTTP_RETRIES, wait, url)
                 await asyncio.sleep(wait)
                 wait = min(wait * 1.9, 30.0)
                 continue
-
             if 400 <= status < 500:
                 STATS["http_4xx"] += 1
-            if status >= 500:
+            if 500 <= status:
                 STATS["http_5xx"] += 1
-
             r.raise_for_status()
-            return r.json()
-
-        except httpx.HTTPStatusError as e:
-            last_err = f"HTTP {e.response.status_code} {e.response.text[:160]}"
-            if e.response.status_code in (422, 400):
-                # Usually bad params; don't hammer
-                logging.warning(f"[http] {last_err} url={url} params={params}")
-                break
-            logging.warning(f"[http] status err attempt={i}/{attempts} wait={wait:.1f}s url={url}")
-            await asyncio.sleep(wait)
-            wait = min(wait * 1.9, 30.0)
-
+            return r.text
         except Exception as e:
-            last_err = f"{type(e).__name__}: {e}"
-            logging.warning(f"[http] err attempt={i}/{attempts} wait={wait:.1f}s url={url} ({last_err})")
+            last_err = e
+            # backoff on transient errors
+            logging.warning("[http] err attempt=%d/%d wait=%.1fs url=%s err=%s", attempt, MAX_HTTP_RETRIES, wait, url, e)
             await asyncio.sleep(wait)
             wait = min(wait * 1.9, 30.0)
 
-    raise RuntimeError(last_err or "http_get_json failed")
+    raise RuntimeError(str(last_err) if last_err else "http_get_text failed")
+
+async def http_get_json(hc: httpx.AsyncClient, url: str, params: Optional[dict] = None) -> Any:
+    txt = await http_get_text(hc, url, params=params)
+    try:
+        return json.loads(txt)
+    except Exception:
+        # If Polymarket returns non-json error body
+        return {"raw": txt}
 
 # =========================
-# POLYMARKET UNIVERSE
+# RSS PARSER
+# =========================
+def parse_rss(xml_text: str) -> List[Dict[str, str]]:
+    items: List[Dict[str, str]] = []
+    try:
+        root = ET.fromstring(xml_text)
+    except Exception:
+        return items
+
+    # RSS2: channel/item
+    for item in root.findall(".//item"):
+        title = (item.findtext("title") or "").strip()
+        link = (item.findtext("link") or "").strip()
+        guid = (item.findtext("guid") or link or title).strip()
+        desc = (item.findtext("description") or "").strip()
+        pub = (item.findtext("pubDate") or "").strip()
+        if not title:
+            continue
+        items.append({
+            "title": html.unescape(title),
+            "link": link,
+            "guid": guid,
+            "desc": html.unescape(desc),
+            "pub": pub,
+        })
+    return items
+
+def extract_terms(text: str) -> List[str]:
+    # Keep it simple: words, team names, short player names etc.
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = re.sub(r"[^A-Za-z0-9' \-]", " ", text)
+    tokens = [t.strip(" -").lower() for t in text.split() if t.strip()]
+    # Filter tiny junk tokens
+    tokens = [t for t in tokens if len(t) >= 3 and t not in {"the","and","for","with","that","from","this","into","your"}]
+    return tokens
+
+# =========================
+# POLYMARKET HELPERS
+# =========================
+def market_sport_tag(m: Dict[str, Any]) -> Optional[str]:
+    """
+    Best-effort: Polymarket markets often have tags / categories.
+    We try multiple common fields. If none, return None.
+    """
+    for key in ("category", "sport", "league", "slug", "title"):
+        val = m.get(key)
+        if isinstance(val, str) and val:
+            s = val.lower()
+            for tag in SPORTS_ALLOW:
+                if tag in s:
+                    return tag
+    # tags might be list of objects/strings
+    tags = m.get("tags")
+    if isinstance(tags, list):
+        for t in tags:
+            if isinstance(t, str):
+                s = t.lower()
+                for tag in SPORTS_ALLOW:
+                    if tag in s:
+                        return tag
+            if isinstance(t, dict):
+                name = str(t.get("name", "")).lower()
+                slug = str(t.get("slug", "")).lower()
+                for tag in SPORTS_ALLOW:
+                    if tag in name or tag in slug:
+                        return tag
+    return None
+
+def market_title(m: Dict[str, Any]) -> str:
+    return str(m.get("question") or m.get("title") or "").strip()
+
+def get_outcome_prices(m: Dict[str, Any]) -> Dict[str, float]:
+    """
+    Normalize yes/no style market prices.
+    Polymarket API shapes can vary. We'll try common layouts.
+    Returns dict like {"yes": 0.61, "no": 0.41} if possible.
+    """
+    out: Dict[str, float] = {}
+    # Some markets expose "outcomes" list
+    outcomes = m.get("outcomes")
+    if isinstance(outcomes, list):
+        for o in outcomes:
+            if not isinstance(o, dict):
+                continue
+            name = str(o.get("name") or o.get("outcome") or "").lower().strip()
+            p = o.get("price")
+            if p is None:
+                p = o.get("probability")
+            try:
+                fp = float(p)
+            except Exception:
+                continue
+            if "yes" in name:
+                out["yes"] = fp
+            elif name == "no" or "no" in name:
+                out["no"] = fp
+
+    # Some markets have "bestBid"/"bestAsk"/"lastTradePrice"
+    # We'll fall back to "lastTradePrice" for "yes" if it's a single-outcome style (rare).
+    if "yes" not in out:
+        for k in ("lastTradePrice", "last_trade_price", "price"):
+            if k in m:
+                try:
+                    out["yes"] = float(m[k])
+                    break
+                except Exception:
+                    pass
+
+    return out
+
+def mid_price_from_yesno(prices: Dict[str, float]) -> Optional[float]:
+    y = prices.get("yes")
+    n = prices.get("no")
+    if y is None and n is None:
+        return None
+    if y is None and n is not None:
+        return max(0.0, min(1.0, 1.0 - n))
+    if y is not None:
+        return max(0.0, min(1.0, y))
+    return None
+
+def should_alert_key(key: str) -> bool:
+    now = time.time()
+    last = LAST_ALERT_TS.get(key, 0.0)
+    if now - last < ALERT_COOLDOWN_SEC:
+        return False
+    LAST_ALERT_TS[key] = now
+    return True
+
+# =========================
+# UNIVERSE REFRESH
 # =========================
 async def fetch_markets_page(hc: httpx.AsyncClient, offset: int) -> List[Dict[str, Any]]:
     """
-    /markets endpoint supports paging; keep params conservative to avoid 422.
+    /markets endpoint supports paging. IMPORTANT: do NOT pass unsupported params like 'order'/'ascending'.
     """
     url = f"{GAMMA}/markets"
     params = {
-    "active": "true",
-    "closed": "false",
-    "limit": MARKETS_PAGE_LIMIT,
-    "offset": offset,
-}
+        "active": "true",
+        "closed": "false",
+        "limit": MARKETS_PAGE_LIMIT,
+        "offset": offset,
+    }
     data = await http_get_json(hc, url, params=params)
+
+    # Polymarket may return list OR dict with "markets"
     if isinstance(data, list):
         return data
     if isinstance(data, dict) and "markets" in data and isinstance(data["markets"], list):
@@ -256,284 +318,257 @@ async def fetch_markets_page(hc: httpx.AsyncClient, offset: int) -> List[Dict[st
     return []
 
 async def refresh_universe_loop() -> None:
-    async with httpx.AsyncClient(headers={"User-Agent": "PolyBrain/1.0"}) as hc:
+    headers = {"User-Agent": "PolyBrain/1.0 (alerts bot)"}
+    async with httpx.AsyncClient(headers=headers) as hc:
         while True:
+            t0 = time.time()
             try:
-                t0 = time.time()
                 all_markets: List[Dict[str, Any]] = []
-
                 for page in range(MARKETS_MAX_PAGES):
-                    offset = page * MARKETS_PAGE_LIMIT
-                    batch = await fetch_markets_page(hc, offset)
-                    if not batch:
+                    chunk = await fetch_markets_page(hc, offset=page * MARKETS_PAGE_LIMIT)
+                    if not chunk:
                         break
-                    all_markets.extend(batch)
-                    # gentle pacing so we don't get 429
-                    await asyncio.sleep(0.25)
+                    all_markets.extend(chunk)
+                    # small pacing helps avoid 429
+                    await asyncio.sleep(0.15)
 
-                filtered = [m for m in all_markets if is_allowed_sport_market(m)]
+                # Filter: only sports tabs you care about
+                filtered: List[Dict[str, Any]] = []
+                for m in all_markets:
+                    title = market_title(m)
+                    if not title:
+                        continue
+                    tag = market_sport_tag(m)
+                    if tag is None:
+                        continue
+                    filtered.append(m)
 
-                STATE["universe"] = filtered
-                STATE["universe_ts"] = time.time()
+                # Update globals
+                UNIVERSE.clear()
+                UNIVERSE.extend(filtered)
+                UNIVERSE_BY_ID.clear()
+                for m in UNIVERSE:
+                    mid = str(m.get("id") or m.get("marketId") or m.get("market_id") or "")
+                    if mid:
+                        UNIVERSE_BY_ID[mid] = m
 
-                STATS["universe_markets"] = len(filtered)
-                logging.info(f"[universe] markets={len(filtered)} refresh_ok dt={(time.time()-t0):.1f}s sports={sorted(SPORTS_ALLOW)}")
+                STATS["universe_markets"] = len(UNIVERSE)
+
+                dt = time.time() - t0
+                logging.info("[universe] markets=%d refresh_ok dt=%.1fs allow=%s", len(UNIVERSE), dt, ",".join(sorted(SPORTS_ALLOW)))
 
             except Exception as e:
                 STATS["last_error"] = f"universe: {type(e).__name__}: {e}"
-                logging.error(f"[universe] failed: {type(e).__name__}: {e}")
+                logging.error("[universe] failed: %s", STATS["last_error"])
 
             await asyncio.sleep(UNIVERSE_REFRESH_SEC)
 
 # =========================
-# NEWS INGESTION (RSS)
+# NEWS / "INJURY INTEL" REFRESH
 # =========================
-RSS_TITLE_RE = re.compile(r"<title><!\[CDATA\[(.*?)\]\]></title>|<title>(.*?)</title>", re.IGNORECASE)
-
-def extract_titles_from_rss(xml_text: str) -> List[str]:
-    titles: List[str] = []
-    for m in RSS_TITLE_RE.finditer(xml_text or ""):
-        t = (m.group(1) or m.group(2) or "").strip()
-        if t and t.lower() not in ("rss", "channel"):
-            titles.append(t)
-    return titles
-
-def build_terms_from_titles(titles: List[str], max_terms: int) -> List[str]:
-    """
-    Build a small term set from RSS titles.
-    We keep it simple + safe: take meaningful tokens and short n-grams.
-    """
-    bad = set(["the","and","for","with","from","that","this","over","under","vs","at","in","on","to","a","an","of"])
-    terms: List[str] = []
-
-    for title in titles:
-        t = _norm(title)
-        words = [w for w in t.split() if w not in bad and len(w) >= 3]
-        # single tokens
-        for w in words[:12]:
-            terms.append(w)
-        # 2-grams (helps with team names)
-        for i in range(min(len(words)-1, 8)):
-            terms.append(f"{words[i]} {words[i+1]}")
-
-    # de-dupe while preserving order
-    out: List[str] = []
-    seen = set()
-    for x in terms:
-        if x not in seen:
-            seen.add(x)
-            out.append(x)
-        if len(out) >= max_terms:
-            break
-    return out
-
-async def news_loop() -> None:
-    if not NEWS_ENABLED:
-        logging.info("[news] disabled")
-        return
-
-    async with httpx.AsyncClient(headers={"User-Agent": "PolyBrain/1.0"}) as hc:
+async def refresh_news_loop() -> None:
+    headers = {"User-Agent": "PolyBrain/1.0 (news)"}
+    async with httpx.AsyncClient(headers=headers, follow_redirects=True) as hc:
         while True:
             try:
-                titles: List[str] = []
-                for feed in NEWS_FEEDS:
-                    r = await hc.get(feed, timeout=20)
-                    r.raise_for_status()
-                    titles.extend(extract_titles_from_rss(r.text))
-                    await asyncio.sleep(0.2)
+                new_items = 0
+                for feed in FEEDS:
+                    xml_text = await http_get_text(hc, feed, params=None)
+                    items = parse_rss(xml_text)
+                    for it in items[:25]:
+                        key = (it.get("guid") or it.get("link") or it.get("title") or "").strip()
+                        if not key or key in NEWS_ITEMS_SEEN:
+                            continue
+                        NEWS_ITEMS_SEEN.add(key)
+                        new_items += 1
 
-                terms = build_terms_from_titles(titles, NEWS_TERMS_MAX)
-                STATE["news_terms"] = set(terms)
-                STATE["news_ts"] = time.time()
+                        combined = f"{it.get('title','')} {it.get('desc','')}"
+                        terms = extract_terms(combined)
+                        for t in terms:
+                            NEWS_TERMS[t] = NEWS_TERMS.get(t, 0) + 1
 
-                logging.info(f"[news] terms={len(terms)} feeds={len(NEWS_FEEDS)}")
+                        NEWS_RECENT.insert(0, it)
+                        if len(NEWS_RECENT) > NEWS_RECENT_MAX:
+                            NEWS_RECENT.pop()
+
+                STATS["news_terms"] = len(NEWS_TERMS)
+                logging.info("[news] terms=%d feeds=%d new_items=%d", STATS["news_terms"], len(FEEDS), new_items)
 
             except Exception as e:
                 STATS["last_error"] = f"news: {type(e).__name__}: {e}"
-                logging.error(f"[news] failed: {type(e).__name__}: {e}")
+                logging.error("[news] failed: %s", STATS["last_error"])
 
             await asyncio.sleep(NEWS_REFRESH_SEC)
 
 # =========================
-# SCAN / ALERT LOGIC
+# SCANNER
 # =========================
-def score_market_basic(m: Dict[str, Any], news_terms: set) -> Tuple[int, List[str]]:
+def match_news_to_market(title: str) -> Tuple[int, List[str]]:
     """
-    Phase 2-ish: "intelligence" without pretending we have true injury APIs.
-    We score with:
-      - News match count (terms appearing in the market text)
-      - Live-ish markets tend to have more signal, but we keep conservative.
-
-    Returns: (score 0..100, reasons)
+    Returns (match_score, matched_terms)
+    Very simple: if any news term appears in the market title, count it.
     """
-    text = _market_text(m)
-    reasons: List[str] = []
-    if not text:
-        return 0, reasons
+    t = title.lower()
+    matched = []
+    score = 0
+    # only check “stronger” terms (appeared at least twice recently)
+    for term, cnt in list(NEWS_TERMS.items()):
+        if cnt < 2:
+            continue
+        if term in t:
+            score += 1
+            matched.append(term)
+            if score >= 6:
+                break
+    return score, matched
 
-    hits = 0
-    hit_terms: List[str] = []
-    for term in list(news_terms)[:NEWS_TERMS_MAX]:
-        if term and term in text:
-            hits += 1
-            if len(hit_terms) < 4:
-                hit_terms.append(term)
+def build_sell_plan(entry_price: float) -> str:
+    """
+    Simple 50/50 plan. Not financial advice; it’s a rule-based template.
+    """
+    entry_c = int(round(entry_price * 100))
+    tp1 = min(98, entry_c + 8)
+    tp2 = min(99, entry_c + 15)
+    sl = max(1, entry_c - 10)
 
-    if hits > 0:
-        reasons.append(f"news_hits={hits} ({', '.join(hit_terms)})")
-
-    # Basic conservative mapping:
-    # 0 hits => 0 score
-    # 1 hit  => 60
-    # 2 hits => 75
-    # 3 hits => 85
-    # 4+     => 92
-    if hits <= 0:
-        score = 0
-    elif hits == 1:
-        score = 60
-    elif hits == 2:
-        score = 75
-    elif hits == 3:
-        score = 85
-    else:
-        score = 92
-
-    return score, reasons
-
-def format_alert(m: Dict[str, Any], score: int, reasons: List[str]) -> str:
-    q = (m.get("question") or m.get("title") or "Market").strip()
-    slug = m.get("slug", "")
-    url = f"https://polymarket.com/market/{slug}" if slug else "https://polymarket.com"
-
-    msg = (
-        f"🧠 **PolyBrain Signal (Phase 2)**\n"
-        f"🎯 **Score:** {score}/100\n"
-        f"📌 **Market:** {q}\n"
-        f"🔎 **Why:** {', '.join(reasons) if reasons else 'news-linked context detected'}\n"
-        f"🔗 {url}\n"
-        f"\n"
-        f"⚠️ This is an *info alert* (not a guarantee). Use bankroll rules."
+    return (
+        f"📌 **50/50 plan (template)**\n"
+        f"• Sell **50%** at **{tp1}¢** (or first big spike)\n"
+        f"• Sell remaining **50%** at **{tp2}¢** (or late move)\n"
+        f"• If it dumps to **{sl}¢**, consider reducing risk\n"
     )
-    return _cut(msg, 1800)
 
 async def scan_loop() -> None:
-    """
-    Scans filtered universe and emits alerts when score >= ALERT_SCORE_MIN.
-    This is still conservative; you can lower ALERT_SCORE_MIN later.
-    """
-    last_alerted: Dict[str, float] = {}  # slug -> ts (cooldown)
-    cooldown_sec = 60 * 20  # 20 min
-
     while True:
         try:
-            universe: List[Dict[str, Any]] = STATE.get("universe") or []
-            news_terms: set = STATE.get("news_terms") or set()
-
             checked = 0
             value_found = 0
-            alerted = 0
 
-            for m in universe:
+            # Copy universe snapshot so refresh thread can update safely
+            snapshot = list(UNIVERSE)
+
+            for m in snapshot:
+                title = market_title(m)
+                if not title:
+                    continue
                 checked += 1
-                slug = str(m.get("slug") or "")
-                if not slug:
+
+                mid = str(m.get("id") or m.get("marketId") or m.get("market_id") or "")
+                if not mid:
                     continue
 
-                # cooldown
-                ts = last_alerted.get(slug, 0.0)
-                if time.time() - ts < cooldown_sec:
+                prices = get_outcome_prices(m)
+                mid_price = mid_price_from_yesno(prices)
+                if mid_price is None:
                     continue
 
-                score, reasons = score_market_basic(m, news_terms)
-                if score >= ALERT_SCORE_MIN:
-                    value_found += 1
-                    await send_discord(format_alert(m, score, reasons))
-                    STATS["alerts_sent"] += 1
-                    alerted += 1
-                    last_alerted[slug] = time.time()
-                    await asyncio.sleep(0.35)  # discord pacing
+                # movement detection
+                prev = LAST_PRICE.get(mid)
+                prev_ts = LAST_PRICE_TS.get(mid, 0.0)
+                LAST_PRICE[mid] = mid_price
+                LAST_PRICE_TS[mid] = time.time()
 
-            STATS["markets_scanned"] = checked
-            STATS["value_found"] = value_found
+                move_cents = 0.0
+                if prev is not None and (time.time() - prev_ts) <= (10 * 60):
+                    move_cents = abs(mid_price - prev) * 100.0
 
+                # 1) Arb-ish detection (yes+no < threshold)
+                y = prices.get("yes")
+                n = prices.get("no")
+                if y is not None and n is not None:
+                    s = y + n
+                    if s <= ARB_SUM_MAX:
+                        key = f"arb:{mid}"
+                        if should_alert_key(key):
+                            value_found += 1
+                            msg = (
+                                f"🟣 **ARB Candidate**\n"
+                                f"**Market:** {title}\n"
+                                f"YES={int(round(y*100))}¢  |  NO={int(round(n*100))}¢  |  SUM={s:.3f}\n"
+                                f"Edge (rough): **{(1.0 - s)*100:.1f}%**\n"
+                                f"{build_sell_plan(y)}"
+                                f"⚠️ This is a *signal*, not a guarantee. Verify liquidity/spread in-app.\n"
+                            )
+                            await send_discord(msg)
+
+                # 2) News/injury “intel” alert (only if meaningful move + match)
+                if move_cents >= MOVE_ALERT_CENTS:
+                    score, matched_terms = match_news_to_market(title)
+                    if score >= NEWS_MATCH_MIN:
+                        key = f"news:{mid}"
+                        if should_alert_key(key):
+                            # pick the most recent news item containing a matched term
+                            picked = None
+                            for it in NEWS_RECENT[:40]:
+                                txt = (it.get("title","") + " " + it.get("desc","")).lower()
+                                if any(t in txt for t in matched_terms[:4]):
+                                    picked = it
+                                    break
+
+                            headline = picked["title"] if picked else "Relevant news detected"
+                            link = picked.get("link","") if picked else ""
+
+                            value_found += 1
+                            msg = (
+                                f"🟦 **NEWS / INJURY INTEL**\n"
+                                f"**Market:** {title}\n"
+                                f"**Move:** ~{move_cents:.1f}¢ (last ~10m)\n"
+                                f"**Matched terms:** `{', '.join(matched_terms[:6])}`\n"
+                                f"**Headline:** {headline}\n"
+                            )
+                            if link:
+                                msg += f"🔗 {link}\n"
+                            msg += build_sell_plan(mid_price)
+                            msg += "✅ Higher-confidence filter: requires both **price move** + **news match**.\n"
+                            await send_discord(msg)
+
+            STATS["markets_scanned"] += checked
+            STATS["value_found"] += value_found
             logging.info(
-                f"[scan] checked={checked} value_found={value_found} alerted={alerted} "
-                f"universe={STATS['universe_markets']} news_terms={len(news_terms)}"
+                "[scan] checked=%d value_found=%d universe=%d news_terms=%d",
+                checked, value_found, len(snapshot), len(NEWS_TERMS)
             )
 
         except Exception as e:
             STATS["last_error"] = f"scan: {type(e).__name__}: {e}"
-            logging.error(f"[scan] failed: {type(e).__name__}: {e}")
+            logging.error("[scan] failed: %s", STATS["last_error"])
 
-        await asyncio.sleep(SCAN_INTERVAL_SEC)
+        await asyncio.sleep(SCAN_EVERY_SEC)
 
 # =========================
-# HEARTBEAT (daily)
+# HEARTBEAT / STATUS
 # =========================
-def _next_local_run(hour: int, minute: int) -> float:
-    # simple next run in local time (server time)
-    now = time.localtime()
-    today = time.mktime((now.tm_year, now.tm_mon, now.tm_mday, hour, minute, 0, now.tm_wday, now.tm_yday, now.tm_isdst))
-    if today <= time.time():
-        tomorrow = time.mktime((now.tm_year, now.tm_mon, now.tm_mday + 1, hour, minute, 0, now.tm_wday, now.tm_yday, now.tm_isdst))
-        return tomorrow
-    return today
-
 async def heartbeat_loop() -> None:
-    # daily at 9:00 server local time
+    # every 6 hours, send a small status message
     while True:
-        try:
-            nxt = _next_local_run(9, 0)
-            sleep_s = max(5.0, nxt - time.time())
-            await asyncio.sleep(sleep_s)
-
-            msg = (
-                f"🧠 **PolyBrain Daily Health Check**\n\n"
-                f"📊 Markets scanned: **{STATS['markets_scanned']}**\n"
-                f"💎 Value candidates: **{STATS['value_found']}**\n"
-                f"📣 Alerts sent: **{STATS['alerts_sent']}**\n"
-                f"⚠️ Rate limits hit: **{STATS['rate_limits']}**\n"
-                f"🧩 Universe markets: **{STATS['universe_markets']}**\n"
-                f"📰 News terms tracked: **{len(STATE.get('news_terms') or set())}**\n"
-                f"📦 HTTP 4xx: **{STATS['http_4xx']}** | HTTP 5xx: **{STATS['http_5xx']}**\n"
-            )
-            if STATS.get("last_error"):
-                msg += f"\n🔴 Last error: `{str(STATS['last_error'])[:180]}`"
-
-            await send_discord(_cut(msg, 1800))
-
-        except Exception as e:
-            STATS["last_error"] = f"heartbeat: {type(e).__name__}: {e}"
-            logging.error(f"[heartbeat] failed: {type(e).__name__}: {e}")
-            await asyncio.sleep(60)
+        await asyncio.sleep(6 * 3600)
+        last_err = str(STATS["last_error"])[:180] if STATS["last_error"] else "none"
+        msg = (
+            "🫀 **PolyBrain Health Check**\n"
+            f"• Universe markets: **{STATS['universe_markets']}**\n"
+            f"• Markets scanned (lifetime): **{STATS['markets_scanned']}**\n"
+            f"• Signals found (lifetime): **{STATS['value_found']}**\n"
+            f"• Alerts sent (lifetime): **{STATS['alerts_sent']}**\n"
+            f"• Rate limits hit: **{STATS['rate_limits']}**\n"
+            f"• HTTP 4xx: **{STATS['http_4xx']}** | HTTP 5xx: **{STATS['http_5xx']}**\n"
+            f"• Last error: `{last_err}`\n"
+        )
+        await send_discord(msg)
 
 # =========================
-# BOT EVENTS
+# DISCORD EVENTS
 # =========================
 @client.event
 async def on_ready():
-    logging.info(f"Logged in as: {client.user}")
-    await send_discord(
-        "✅ PolyBrain is live.\n"
-        f"🏈 Sports: {', '.join(sorted(SPORTS_ALLOW))} | ❌ Excluding: {', '.join(sorted(SPORTS_EXCLUDE))}\n"
-        f"📰 News ingestion: {'ON' if NEWS_ENABLED else 'OFF'} | 🎯 Alert threshold: {ALERT_SCORE_MIN}/100"
-    )
-
-    # start background tasks (only once)
-    if not STATE.get("_tasks_started"):
-        STATE["_tasks_started"] = True
-        asyncio.create_task(refresh_universe_loop())
-        asyncio.create_task(scan_loop())
-        asyncio.create_task(heartbeat_loop())
-        if NEWS_ENABLED:
-            asyncio.create_task(news_loop())
+    logging.info("Logged in as: %s", client.user)
+    await send_discord("✅ PolyBrain is live. **Phase 2 (News/Injury Intel)** scanning is ON.")
+    # start loops
+    asyncio.create_task(refresh_universe_loop())
+    asyncio.create_task(refresh_news_loop())
+    asyncio.create_task(scan_loop())
+    asyncio.create_task(heartbeat_loop())
 
 # =========================
-# ENTRY
+# RUN
 # =========================
-def main() -> None:
-    client.run(DISCORD_BOT_TOKEN)
-
-if __name__ == "__main__":
-    main()
+client.run(DISCORD_BOT_TOKEN)
