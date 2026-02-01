@@ -11,17 +11,26 @@ if not TOKEN or not CHANNEL_ID:
 CHANNEL_ID = int(CHANNEL_ID)
 
 intents = discord.Intents.default()
+intents.guilds = True  # important for channel fetch in some setups
+
 client = discord.Client(intents=intents)
 
 @client.event
 async def on_ready():
-    print(f"Logged in as: {client.user} (id={client.user.id})", flush=True)
-    print(f"Sending test message to channel {CHANNEL_ID}...", flush=True)
+    try:
+        print(f"Logged in as: {client.user} (id={client.user.id})", flush=True)
+        print(f"Attempting fetch_channel({CHANNEL_ID})...", flush=True)
 
-    channel = client.get_channel(CHANNEL_ID) or await client.fetch_channel(CHANNEL_ID)
-    await channel.send("✅ PolyBrain is live on Railway. Alerts are working.")
+        channel = await client.fetch_channel(CHANNEL_ID)  # force API fetch
+        print(f"Fetched channel: {channel} (type={type(channel)})", flush=True)
 
-    print("Test message sent. Sleeping...", flush=True)
+        await channel.send("✅ PolyBrain is live on Railway. Alerts are working.")
+        print("Sent message successfully ✅", flush=True)
+
+    except Exception as e:
+        print("❌ FAILED to send message:", repr(e), flush=True)
+        raise
+
     while True:
         await asyncio.sleep(3600)
 
