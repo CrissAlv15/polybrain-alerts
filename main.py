@@ -1,226 +1,157 @@
 import os
 import asyncio
 import time
-from typing import Dict, Any, List, Optional, Tuple
-
-import discord
 import httpx
 
-# ----------------------------
-# Required env vars (Railway Variables)
-# ----------------------------
-DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
-DISCORD_CHANNEL_ID = os.getenv("DISCORD_CHANNEL_ID")
+from discord_alerts import client, send
+from polymarket import list_active_markets, extract_sports_moneyline_markets
+from odds import get_h2h_probs, consensus_probs_from_event
+from signals import detect_value, detect_simple_arb
 
-# ----------------------------
-# Optional env vars
-# ----------------------------
-SCAN_INTERVAL_SECONDS = int(os.getenv("SCAN_INTERVAL_SECONDS", "20"))  # how often we scan
-MIN_EDGE = float(os.getenv("MIN_EDGE", "0.01"))  # 0.01 = 1% edge
-ALERT_COOLDOWN_SECONDS = int(os.getenv("ALERT_COOLDOWN_SECONDS", "300"))  # 5 min
-MAX_LEAGUES = int(os.getenv("MAX_LEAGUES", "999"))  # cap leagues if you want
-HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "15"))
+# ===== Config =====
+SCAN_SECONDS = int(os.getenv("SCAN_SECONDS", "30"))
 
-# Polymarket public APIs (no auth)
-GAMMA_BASE = "https://gamma-api.polymarket.com"
-CLOB_BASE = "https://clob.polymarket.com"
+# Stay cheap on free tier: only check a few sports keys.
+# Add more later when you upgrade.
+SPORT_KEYS = os.getenv("SPORT_KEYS", "icehockey_nhl,basketball_nba").split(",")
 
-if not DISCORD_BOT_TOKEN or not DISCORD_CHANNEL_ID:
-    raise SystemExit("Missing DISCORD_BOT_TOKEN or DISCORD_CHANNEL_ID in Railway Variables")
+# Avoid repeat spam
+COOLDOWN_MINUTES = int(os.getenv("COOLDOWN_MINUTES", "60"))
 
-CHANNEL_ID_INT = int(DISCORD_CHANNEL_ID)
+# value threshold (0.07 = 7% misprice)
+VALUE_THRESHOLD = float(os.getenv("VALUE_THRESHOLD", "0.07"))
 
-intents = discord.Intents.default()
-client = discord.Client(intents=intents)
+# ===== state =====
+last_alert_at = {}  # key -> epoch seconds
 
-# In-memory dedupe: token_id(s) -> last alert time + last edge
-last_alert: Dict[str, Dict[str, float]] = {}  # {"key": {"t": epoch, "edge": edge}}
+def can_alert(key: str) -> bool:
+    now = time.time()
+    last = last_alert_at.get(key, 0)
+    return (now - last) >= (COOLDOWN_MINUTES * 60)
 
-# Reuse HTTP connection pool
-http = httpx.AsyncClient(timeout=HTTP_TIMEOUT)
+def mark_alert(key: str):
+    last_alert_at[key] = time.time()
 
-def now() -> float:
-    return time.time()
-
-def _dedupe_key(event_id: Any, market_id: Any, token_ids: List[str]) -> str:
-    token_part = ",".join(token_ids)
-    return f"event:{event_id}|market:{market_id}|tokens:{token_part}"
-
-async def fetch_json(url: str, params: Optional[dict] = None) -> Any:
-    r = await http.get(url, params=params)
-    r.raise_for_status()
-    return r.json()
-
-async def get_sports_leagues() -> List[Dict[str, Any]]:
-    # docs: GET https://gamma-api.polymarket.com/sports  (no auth)
-    return await fetch_json(f"{GAMMA_BASE}/sports")
-
-async def get_active_events_for_series(series_id: int, limit: int = 100) -> List[Dict[str, Any]]:
-    # docs show: /events?series_id=...&active=true&closed=false
-    # We'll keep it simple and paginate with offset.
-    all_events: List[Dict[str, Any]] = []
-    offset = 0
-    while True:
-        params = {
-            "series_id": series_id,
-            "active": "true",
-            "closed": "false",
-            "limit": str(limit),
-            "offset": str(offset),
-            "order": "startTime",
-            "ascending": "true",
-        }
-        batch = await fetch_json(f"{GAMMA_BASE}/events", params=params)
-        if not batch:
-            break
-        all_events.extend(batch)
-        if len(batch) < limit:
-            break
-        offset += limit
-        await asyncio.sleep(0.05)
-    return all_events
-
-async def get_buy_price(token_id: str) -> Optional[float]:
-    # docs: GET https://clob.polymarket.com/price?token_id=...&side=buy
-    try:
-        data = await fetch_json(f"{CLOB_BASE}/price", params={"token_id": token_id, "side": "buy"})
-        p = float(data["price"])
-        if p <= 0 or p >= 1:
-            return None
-        return p
-    except Exception:
-        return None
-
-async def detect_binary_arb(event: Dict[str, Any], market: Dict[str, Any]) -> Optional[Tuple[float, str]]:
+def best_match_market_to_event(question: str, event: dict):
     """
-    Binary arb: buy YES token + buy NO token costs < 1.0
-    Profit per 1 share set = 1 - (p_yes + p_no)
+    MVP matching: naive string contains checks.
+    Later we can do better mapping.
     """
-    token_ids = market.get("clobTokenIds")
-    if not token_ids or len(token_ids) != 2:
-        return None
+    q = (question or "").lower()
+    home = (event["home_team"] or "").lower()
+    away = (event["away_team"] or "").lower()
+    return (home in q) and (away in q)
 
-    yes_id, no_id = token_ids[0], token_ids[1]
+async def scan_loop():
+    async with httpx.AsyncClient() as http:
+        # 1) Pull Polymarket sports H2H markets (paged a bit)
+        poly_all = []
+        for off in (0, 200, 400):
+            raw = await list_active_markets(http, limit=200, offset=off)
+            poly_all.extend(raw)
 
-    p_yes, p_no = await asyncio.gather(get_buy_price(yes_id), get_buy_price(no_id))
-    if p_yes is None or p_no is None:
-        return None
+        poly_markets = extract_sports_moneyline_markets(poly_all)
 
-    cost = p_yes + p_no
-    edge = 1.0 - cost
-    if edge < MIN_EDGE:
-        return None
+        # 2) Pull sportsbook consensus odds (limited sports)
+        events = []
+        for sk in SPORT_KEYS:
+            try:
+                data = await get_h2h_probs(http, sk.strip())
+                for ev in data:
+                    c = consensus_probs_from_event(ev)
+                    if c["home_p"] and c["away_p"]:
+                        events.append(c)
+            except Exception as e:
+                print(f"[odds] sport={sk} error={e}")
 
-    title = event.get("title") or market.get("question") or "Unknown market"
-    event_id = event.get("id", "?")
-    market_id = market.get("id", "?")
+        checked = 0
+        arbs = 0
+        values = 0
 
-    msg = (
-        f"🚨 **Polymarket Arb Found (Binary)**\n"
-        f"**{title}**\n"
-        f"Cost to buy both outcomes: **{cost:.4f}**\n"
-        f"Edge (profit per 1-share set): **{edge:.4f}** ({edge*100:.2f}%)\n"
-        f"YES buy price: **{p_yes:.4f}** | NO buy price: **{p_no:.4f}**\n"
-        f"IDs: event `{event_id}` market `{market_id}`\n"
-        f"Token IDs: `{yes_id}`, `{no_id}`"
-    )
-    return edge, msg
+        # 3) Match + generate signals
+        for m in poly_markets:
+            checked += 1
+            q = m["question"]
+            p_yes = m["prices"][0]  # outcome 0 price
+            outcomes = m["outcomes"]
 
-def should_alert(key: str, edge: float) -> bool:
-    info = last_alert.get(key)
-    t = now()
-    if not info:
-        return True
-    if t - info["t"] >= ALERT_COOLDOWN_SECONDS:
-        return True
-    # If edge improved meaningfully, alert again (optional)
-    if edge > info["edge"] + 0.002:  # +0.2% improvement
-        return True
-    return False
+            # Only do a rough match
+            match = None
+            for ev in events:
+                if best_match_market_to_event(q, ev):
+                    match = ev
+                    break
+            if not match:
+                continue
 
-def mark_alerted(key: str, edge: float) -> None:
-    last_alert[key] = {"t": now(), "edge": edge}
+            # Map outcome0 -> home or away (MVP guess: if outcome name contains home team)
+            home = match["home_team"]
+            away = match["away_team"]
+            out0 = (outcomes[0] or "").lower()
 
-async def scan_once(channel: discord.TextChannel) -> None:
-    leagues = await get_sports_leagues()
-    leagues = leagues[:MAX_LEAGUES]
+            if home.lower() in out0:
+                fair_p = match["home_p"]
+                side = home
+                poly_p = p_yes
+            elif away.lower() in out0:
+                fair_p = match["away_p"]
+                side = away
+                poly_p = p_yes
+            else:
+                continue
 
-    # Each league object usually has series_id
-    series_ids = []
-    for lg in leagues:
-        sid = lg.get("series_id") or lg.get("seriesId") or lg.get("id")
-        if isinstance(sid, int):
-            series_ids.append(sid)
+            key = f"{m['id']}:{side}"
 
-    if not series_ids:
-        await channel.send("⚠️ No sports leagues found from /sports. (API issue?)")
-        return
+            # VALUE alert
+            v = detect_value(poly_p=poly_p, fair_p=fair_p, threshold=VALUE_THRESHOLD)
+            if v and can_alert(key):
+                values += 1
+                mark_alert(key)
 
-    # Pull events per league (concurrently, but not too hard)
-    sem = asyncio.Semaphore(6)
+                tp1 = int(v["tp1"] * 100)
+                tp2 = int(v["tp2"] * 100)
 
-    async def fetch_events_guarded(sid: int):
-        async with sem:
-            return sid, await get_active_events_for_series(sid)
+                msg = (
+                    f"📣 **VALUE** on **{side}**\n"
+                    f"• Market: {q}\n"
+                    f"• Polymarket price: **{int(poly_p*100)}¢**\n"
+                    f"• Sportsbook fair: **{int(fair_p*100)}%**\n"
+                    f"• Edge: **{v['edge']*100:.1f}%**\n\n"
+                    f"**Sell plan**\n"
+                    f"• Sell 50% at **{tp1}¢**\n"
+                    f"• Sell rest at **{tp2}¢**\n"
+                    + (f"\n{m['url']}" if m.get("url") else "")
+                )
+                await send(msg)
 
-    results = await asyncio.gather(*[fetch_events_guarded(sid) for sid in series_ids])
+            # ARB candidate alert (only if no VALUE fired)
+            if not v:
+                a = detect_simple_arb(poly_p=poly_p, fair_p=fair_p, threshold=0.10)
+                if a and can_alert(key + ":arb"):
+                    arbs += 1
+                    mark_alert(key + ":arb")
+                    msg = (
+                        f"⚡ **ARB CANDIDATE** ({a['diff']*100:.1f}% off fair)\n"
+                        f"• {side}\n"
+                        f"• Market: {q}\n"
+                        f"• Polymarket: **{int(poly_p*100)}¢** vs fair **{int(fair_p*100)}%**\n"
+                        f"• Check if your sportsbook lines still match before taking.\n"
+                        + (f"\n{m['url']}" if m.get("url") else "")
+                    )
+                    await send(msg)
 
-    found = 0
-    checked = 0
-
-    for sid, events in results:
-        for event in events:
-            markets = event.get("markets") or []
-            for market in markets:
-                checked += 1
-                # Binary markets are the common sports ones (Yes/No or Team A/Team B)
-                arb = await detect_binary_arb(event, market)
-                if not arb:
-                    continue
-
-                edge, msg = arb
-                token_ids = market.get("clobTokenIds") or []
-                key = _dedupe_key(event.get("id", "?"), market.get("id", "?"), token_ids)
-
-                if should_alert(key, edge):
-                    await channel.send(msg)
-                    mark_alerted(key, edge)
-                    found += 1
-
-                # tiny pause to be nice
-                await asyncio.sleep(0.03)
-
-    print(f"[scan] checked={checked} arbs_found={found}")
-
-async def scan_loop() -> None:
-    await client.wait_until_ready()
-
-    # Always use fetch_channel to avoid cache issues
-    channel = await client.fetch_channel(CHANNEL_ID_INT)
-
-    await channel.send("✅ PolyBrain is live on Railway. Scanning Polymarket sports for internal arbs.")
-
-    while True:
-        try:
-            await scan_once(channel)
-        except Exception as e:
-            print(f"[error] scan_loop: {repr(e)}")
-        await asyncio.sleep(SCAN_INTERVAL_SECONDS)
+        print(f"[scan] checked={checked} arbs_found={arbs} value_found={values}")
 
 @client.event
 async def on_ready():
-    print(f"Logged in as: {client.user} (id={client.user.id})")
-    client.loop.create_task(scan_loop())
-
-def main():
-    try:
-        client.run(DISCORD_BOT_TOKEN)
-    finally:
-        # best effort cleanup
+    print(f"Logged in as: {client.user}")
+    await send("✅ PolyBrain is live on Railway. Scanning started.")
+    while True:
         try:
-            asyncio.get_event_loop().run_until_complete(http.aclose())
-        except Exception:
-            pass
+            await scan_loop()
+        except Exception as e:
+            print(f"[fatal] {e}")
+        await asyncio.sleep(SCAN_SECONDS)
 
 if __name__ == "__main__":
-    main()
+    client.run(os.getenv("DISCORD_BOT_TOKEN"))
